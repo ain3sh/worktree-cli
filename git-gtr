@@ -1,0 +1,2817 @@
+#!/usr/bin/env bash
+#
+# git-gtr - Git Worktree Runner (Standalone Edition)
+# https://github.com/coderabbitai/git-worktree-runner
+#
+# This is a single-file distribution that bundles all dependencies.
+# Licensed under Apache 2.0
+#
+
+set -e
+
+# ============================================================================
+# DEPENDENCY CHECKS
+# ============================================================================
+
+GTR_STANDALONE=1
+
+check_dependencies() {
+  local missing=0
+  local install_hint=""
+
+  # Detect OS for install hints
+  local os=""
+  case "$OSTYPE" in
+    darwin*) os="macos" ;;
+    linux*) os="linux" ;;
+    msys*|cygwin*|win32*) os="windows" ;;
+  esac
+
+  # Check Bash version (3.2+ required)
+  local bash_version="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+  local bash_major="${BASH_VERSINFO[0]}"
+
+  if [ "$bash_major" -lt 3 ] || { [ "$bash_major" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+    echo "[x] Bash 3.2+ required (found: $bash_version)" >&2
+    missing=1
+    case "$os" in
+      macos) install_hint="$install_hint\n  brew install bash" ;;
+      linux) install_hint="$install_hint\n  sudo apt-get install bash  # Debian/Ubuntu\n  sudo dnf install bash       # Fedora" ;;
+    esac
+  fi
+
+  # Check Git (2.5+ required for worktree support)
+  if ! command -v git >/dev/null 2>&1; then
+    echo "[x] Git not found" >&2
+    missing=1
+    case "$os" in
+      macos) install_hint="$install_hint\n  brew install git  # or: xcode-select --install" ;;
+      linux) install_hint="$install_hint\n  sudo apt-get install git  # Debian/Ubuntu\n  sudo dnf install git       # Fedora" ;;
+      windows) install_hint="$install_hint\n  Download from https://git-scm.com/download/win" ;;
+    esac
+  else
+    # Check Git version
+    local git_version_full
+    git_version_full=$(git --version 2>/dev/null | sed 's/git version //')
+    local git_major git_minor
+    git_major=$(echo "$git_version_full" | cut -d. -f1)
+    git_minor=$(echo "$git_version_full" | cut -d. -f2)
+
+    if [ "$git_major" -lt 2 ] || { [ "$git_major" -eq 2 ] && [ "$git_minor" -lt 5 ]; }; then
+      echo "[x] Git 2.5+ required for worktree support (found: $git_version_full)" >&2
+      missing=1
+      case "$os" in
+        macos) install_hint="$install_hint\n  brew upgrade git" ;;
+        linux) install_hint="$install_hint\n  sudo apt-get update && sudo apt-get install git" ;;
+      esac
+    fi
+  fi
+
+  if [ "$missing" -eq 1 ]; then
+    echo "" >&2
+    echo "Missing dependencies. Install with:" >&2
+    echo -e "$install_hint" >&2
+    echo "" >&2
+    exit 1
+  fi
+}
+
+# Run dependency check on first invocation (skip for --version/--help)
+case "${1:-}" in
+  version|--version|-v) ;;
+  help|--help|-h) ;;
+  *) check_dependencies ;;
+esac
+
+
+# Version
+GTR_VERSION="2.0.0"
+
+# ============================================================================
+# EMBEDDED LIBRARIES
+# ============================================================================
+
+# --- lib/ui.sh ---
+# UI utilities for logging and prompting
+
+log_info() {
+  printf "[OK] %s\n" "$*" >&2
+}
+
+log_warn() {
+  printf "[!] %s\n" "$*" >&2
+}
+
+log_error() {
+  printf "[x] %s\n" "$*" >&2
+}
+
+log_step() {
+  printf "==> %s\n" "$*" >&2
+}
+
+log_question() {
+  printf "[?] %s" "$*"
+}
+
+# Prompt for yes/no confirmation
+# Usage: prompt_yes_no "Question text" [default]
+# Returns: 0 for yes, 1 for no
+prompt_yes_no() {
+  local question="$1"
+  local default="${2:-n}"
+  local prompt_suffix="[y/N]"
+
+  if [ "$default" = "y" ]; then
+    prompt_suffix="[Y/n]"
+  fi
+
+  log_question "$question $prompt_suffix "
+  read -r reply
+
+  case "$reply" in
+    [yY]|[yY][eE][sS])
+      return 0
+      ;;
+    [nN]|[nN][oO])
+      return 1
+      ;;
+    "")
+      [ "$default" = "y" ] && return 0 || return 1
+      ;;
+    *)
+      [ "$default" = "y" ] && return 0 || return 1
+      ;;
+  esac
+}
+
+# Prompt for text input
+# Usage: prompt_input "Question text" [variable_name]
+# If variable_name provided, sets it, otherwise echoes result
+prompt_input() {
+  local question="$1"
+  local var_name="$2"
+
+  log_question "$question "
+  read -r input
+
+  if [ -n "$var_name" ]; then
+    eval "$var_name=\"\$input\""
+  else
+    printf "%s" "$input"
+  fi
+}
+
+# --- lib/config.sh ---
+# Configuration management via git config
+# Default values are defined where they're used in lib/core.sh
+
+# Get a single config value
+# Usage: cfg_get key [scope]
+# scope: auto (default), local, global, or system
+# auto uses git's built-in precedence: local > global > system
+cfg_get() {
+  local key="$1"
+  local scope="${2:-auto}"
+  local flag=""
+
+  case "$scope" in
+    local)  flag="--local" ;;
+    global) flag="--global" ;;
+    system) flag="--system" ;;
+    auto|*) flag="" ;;
+  esac
+
+  git config $flag --get "$key" 2>/dev/null || true
+}
+
+# Get all values for a multi-valued config key
+# Usage: cfg_get_all key [scope]
+# scope: auto (default), local, global, or system
+# auto merges local + global + system and deduplicates
+cfg_get_all() {
+  local key="$1"
+  local scope="${2:-auto}"
+
+  case "$scope" in
+    local)
+      git config --local --get-all "$key" 2>/dev/null || true
+      ;;
+    global)
+      git config --global --get-all "$key" 2>/dev/null || true
+      ;;
+    system)
+      git config --system --get-all "$key" 2>/dev/null || true
+      ;;
+    auto|*)
+      # Merge all levels and deduplicate while preserving order
+      {
+        git config --local  --get-all "$key" 2>/dev/null || true
+        git config --global --get-all "$key" 2>/dev/null || true
+        git config --system --get-all "$key" 2>/dev/null || true
+      } | awk '!seen[$0]++'
+      ;;
+  esac
+}
+
+# Get a boolean config value
+# Usage: cfg_bool key [default]
+# Returns: 0 for true, 1 for false
+cfg_bool() {
+  local key="$1"
+  local default="${2:-false}"
+  local value
+
+  value=$(cfg_get "$key")
+
+  if [ -z "$value" ]; then
+    value="$default"
+  fi
+
+  case "$value" in
+    true|yes|1|on)
+      return 0
+      ;;
+    false|no|0|off|*)
+      return 1
+      ;;
+  esac
+}
+
+# Set a config value
+# Usage: cfg_set key value [--global]
+cfg_set() {
+  local key="$1"
+  local value="$2"
+  local scope="${3:-local}"
+  local flag=""
+
+  case "$scope" in
+    --global|global) flag="--global" ;;
+    --system|system) flag="--system" ;;
+    --local|local|*) flag="--local" ;;
+  esac
+
+  git config $flag "$key" "$value"
+}
+
+# Add a value to a multi-valued config key
+# Usage: cfg_add key value [--global]
+cfg_add() {
+  local key="$1"
+  local value="$2"
+  local scope="${3:-local}"
+  local flag=""
+
+  case "$scope" in
+    --global|global) flag="--global" ;;
+    --system|system) flag="--system" ;;
+    --local|local|*) flag="--local" ;;
+  esac
+
+  git config $flag --add "$key" "$value"
+}
+
+# Unset a config value
+# Usage: cfg_unset key [--global]
+cfg_unset() {
+  local key="$1"
+  local scope="${2:-local}"
+  local flag=""
+
+  case "$scope" in
+    --global|global) flag="--global" ;;
+    --system|system) flag="--system" ;;
+    --local|local|*) flag="--local" ;;
+  esac
+
+  git config $flag --unset "$key" 2>/dev/null || true
+}
+
+# Get config value with environment variable fallback
+# Usage: cfg_default key env_name fallback_value
+# Now uses auto scope by default (checks local, global, system)
+cfg_default() {
+  local key="$1"
+  local env_name="$2"
+  local fallback="$3"
+  local value
+
+  # Try git config first (auto scope - checks local > global > system)
+  value=$(cfg_get "$key" auto)
+
+  # Fall back to environment variable (POSIX-compliant indirect reference)
+  if [ -z "$value" ] && [ -n "$env_name" ]; then
+    eval "value=\${${env_name}:-}"
+  fi
+
+  # Use fallback if still empty
+  printf "%s" "${value:-$fallback}"
+}
+
+# --- lib/platform.sh ---
+# Platform-specific utilities
+
+# Detect operating system
+# Returns: darwin, linux, or windows
+detect_os() {
+  case "$OSTYPE" in
+    darwin*)
+      echo "darwin"
+      ;;
+    linux*)
+      echo "linux"
+      ;;
+    msys*|cygwin*|win32*)
+      echo "windows"
+      ;;
+    *)
+      # Fallback to uname
+      case "$(uname -s 2>/dev/null)" in
+        Darwin)
+          echo "darwin"
+          ;;
+        Linux)
+          echo "linux"
+          ;;
+        MINGW*|MSYS*|CYGWIN*)
+          echo "windows"
+          ;;
+        *)
+          echo "unknown"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+# Open a directory in the system's GUI file browser
+# Usage: open_in_gui path
+open_in_gui() {
+  local path="$1"
+  local os
+
+  os=$(detect_os)
+
+  case "$os" in
+    darwin)
+      open "$path" 2>/dev/null || true
+      ;;
+    linux)
+      # Try common Linux file managers
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$path" >/dev/null 2>&1 || true
+      elif command -v gnome-open >/dev/null 2>&1; then
+        gnome-open "$path" >/dev/null 2>&1 || true
+      fi
+      ;;
+    windows)
+      if command -v cygpath >/dev/null 2>&1; then
+        cmd.exe /c start "" "$(cygpath -w "$path")" 2>/dev/null || true
+      else
+        cmd.exe /c start "" "$path" 2>/dev/null || true
+      fi
+      ;;
+    *)
+      log_warn "Cannot open GUI on unknown OS"
+      return 1
+      ;;
+  esac
+}
+
+# Spawn a new terminal window/tab in a directory
+# Usage: spawn_terminal_in path title [command]
+# Note: Best-effort implementation, may not work on all systems
+spawn_terminal_in() {
+  local path="$1"
+  local title="$2"
+  local cmd="${3:-}"
+  local os
+
+  os=$(detect_os)
+
+  case "$os" in
+    darwin)
+      # Try iTerm2 first, then Terminal.app
+      if osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null | grep -q "iTerm"; then
+        osascript <<-EOF 2>/dev/null || true
+					tell application "iTerm"
+						tell current window
+							create tab with default profile
+							tell current session
+								write text "cd \"$path\""
+								set name to "$title"
+								$([ -n "$cmd" ] && echo "write text \"$cmd\"")
+							end tell
+						end tell
+					end tell
+				EOF
+      else
+        osascript <<-EOF 2>/dev/null || true
+					tell application "Terminal"
+						do script "cd \"$path\"; $cmd"
+						set custom title of front window to "$title"
+					end tell
+				EOF
+      fi
+      ;;
+    linux)
+      # Try common terminal emulators
+      if command -v gnome-terminal >/dev/null 2>&1; then
+        gnome-terminal --working-directory="$path" --title="$title" -- sh -c "$cmd; exec \$SHELL" 2>/dev/null || true
+      elif command -v konsole >/dev/null 2>&1; then
+        konsole --workdir "$path" -p "tabtitle=$title" -e sh -c "$cmd; exec \$SHELL" 2>/dev/null || true
+      elif command -v xterm >/dev/null 2>&1; then
+        xterm -T "$title" -e "cd \"$path\" && $cmd && exec \$SHELL" 2>/dev/null || true
+      else
+        log_warn "No supported terminal emulator found"
+        return 1
+      fi
+      ;;
+    windows)
+      # Try Windows Terminal, then fallback to cmd
+      if command -v wt >/dev/null 2>&1; then
+        wt -d "$path" "$cmd" 2>/dev/null || true
+      else
+        cmd.exe /c start "$title" cmd.exe /k "cd /d \"$path\" && $cmd" 2>/dev/null || true
+      fi
+      ;;
+    *)
+      log_warn "Cannot spawn terminal on unknown OS"
+      return 1
+      ;;
+  esac
+}
+
+# --- lib/core.sh ---
+# Core git worktree operations
+
+# Discover the root of the current git repository
+# Returns: absolute path to repo root
+# Exit code: 0 on success, 1 if not in a git repo
+discover_repo_root() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null)
+
+  if [ -z "$root" ]; then
+    log_error "Not in a git repository"
+    return 1
+  fi
+
+  printf "%s" "$root"
+}
+
+# Sanitize branch name for use as directory name
+# Usage: sanitize_branch_name branch_name
+# Converts special characters to hyphens for valid folder names
+sanitize_branch_name() {
+  local branch="$1"
+
+  # Replace slashes, spaces, and other problematic chars with hyphens
+  # Remove any leading/trailing hyphens
+  printf "%s" "$branch" | sed -e 's/[\/\\ :*?"<>|]/-/g' -e 's/^-*//' -e 's/-*$//'
+}
+
+# Canonicalize a path to its absolute form, resolving symlinks
+# Usage: canonicalize_path path
+# Returns: canonical path or empty string on failure
+canonicalize_path() {
+  local path="$1"
+  # Unset CDPATH to prevent unexpected directory changes
+  # Suppress stderr to hide errors for non-existent directories
+  # Use subshell to avoid changing current working directory
+  ( unset CDPATH && cd -P -- "$path" 2>/dev/null && pwd -P )
+}
+
+# Resolve the base directory for worktrees
+# Usage: resolve_base_dir repo_root
+resolve_base_dir() {
+  local repo_root="$1"
+  local repo_name
+  local base_dir
+
+  repo_name=$(basename "$repo_root")
+
+  # Check config first (gtr.worktrees.dir), then environment (GTR_WORKTREES_DIR), then default
+  base_dir=$(cfg_default "gtr.worktrees.dir" "GTR_WORKTREES_DIR" "")
+
+  if [ -z "$base_dir" ]; then
+    # Default: <repo>-worktrees next to the repo
+    base_dir="$(dirname "$repo_root")/${repo_name}-worktrees"
+  else
+    # Expand tilde to home directory
+    case "$base_dir" in
+      ~/*) base_dir="$HOME/${base_dir#~/}" ;;
+      ~) base_dir="$HOME" ;;
+    esac
+
+    # Check if absolute or relative
+    if [ "${base_dir#/}" = "$base_dir" ]; then
+      # Relative path - resolve from repo root
+      base_dir="$repo_root/$base_dir"
+    fi
+    # Absolute paths (starting with /) are used as-is
+  fi
+
+  # Canonicalize base_dir if it exists
+  if [ -d "$base_dir" ]; then
+    local canonical_base
+    canonical_base=$(canonicalize_path "$base_dir")
+    if [ -n "$canonical_base" ]; then
+      base_dir="$canonical_base"
+    fi
+    # If canonicalization fails (empty result), base_dir keeps its absolute form
+  fi
+
+  # Canonicalize repo_root before comparison
+  local canonical_repo_root
+  canonical_repo_root=$(canonicalize_path "$repo_root")
+  # Warn if canonicalization fails (indicates repository issue)
+  if [ -z "$canonical_repo_root" ]; then
+    log_warn "Unable to canonicalize repository path: $repo_root"
+    canonical_repo_root="$repo_root"
+  fi
+
+  # Warn if worktree dir is inside repo (but not a sibling)
+  if [[ "$base_dir" == "$canonical_repo_root"/* ]]; then
+    local rel_path="${base_dir#$canonical_repo_root/}"
+    # Check if .gitignore exists and whether it includes the worktree directory
+    if [ -f "$canonical_repo_root/.gitignore" ]; then
+      if ! grep -qE "^/?${rel_path}/?\$|^/?${rel_path}/\*?\$" "$canonical_repo_root/.gitignore" 2>/dev/null; then
+        log_warn "Worktrees are inside repository at: $rel_path"
+        log_warn "Consider adding '/$rel_path/' to .gitignore to avoid committing worktrees"
+      fi
+    else
+      log_warn "Worktrees are inside repository at: $rel_path"
+      log_warn "Consider adding '/$rel_path/' to .gitignore"
+    fi
+  fi
+
+  printf "%s" "$base_dir"
+}
+
+# Resolve the default branch name
+# Usage: resolve_default_branch [repo_root]
+resolve_default_branch() {
+  local repo_root="${1:-$(pwd)}"
+  local default_branch
+  local configured_branch
+
+  # Check config first
+  configured_branch=$(cfg_default "gtr.defaultBranch" "GTR_DEFAULT_BRANCH" "auto")
+
+  if [ "$configured_branch" != "auto" ]; then
+    printf "%s" "$configured_branch"
+    return 0
+  fi
+
+  # Auto-detect from origin/HEAD
+  default_branch=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+
+  if [ -n "$default_branch" ]; then
+    printf "%s" "$default_branch"
+    return 0
+  fi
+
+  # Fallback: try common branch names
+  if git show-ref --verify --quiet "refs/remotes/origin/main"; then
+    printf "main"
+  elif git show-ref --verify --quiet "refs/remotes/origin/master"; then
+    printf "master"
+  else
+    # Last resort: just use 'main'
+    printf "main"
+  fi
+}
+
+# Get the current branch of a worktree
+# Usage: current_branch worktree_path
+current_branch() {
+  local worktree_path="$1"
+  local branch
+
+  if [ ! -d "$worktree_path" ]; then
+    return 1
+  fi
+
+  # Try --show-current (Git 2.22+), fallback to rev-parse for older Git
+  branch=$(cd "$worktree_path" && git branch --show-current 2>/dev/null)
+  if [ -z "$branch" ]; then
+    branch=$(cd "$worktree_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  fi
+
+  # Normalize detached HEAD
+  if [ "$branch" = "HEAD" ]; then
+    branch="(detached)"
+  fi
+
+  printf "%s" "$branch"
+}
+
+# Get the status of a worktree from git
+# Usage: worktree_status worktree_path
+# Returns: status (ok, detached, locked, prunable, or missing)
+worktree_status() {
+  local target_path="$1"
+  local porcelain_output
+  local in_section=0
+  local status="ok"
+  local found=0
+
+  # Parse git worktree list --porcelain line by line
+  porcelain_output=$(git worktree list --porcelain 2>/dev/null)
+
+  while IFS= read -r line; do
+    # Check if this is the start of our target worktree
+    if [ "$line" = "worktree $target_path" ]; then
+      in_section=1
+      found=1
+      continue
+    fi
+
+    # If we're in the target section, check for status lines
+    if [ "$in_section" -eq 1 ]; then
+      # Empty line marks end of section
+      if [ -z "$line" ]; then
+        break
+      fi
+
+      # Check for status indicators (priority: locked > prunable > detached)
+      case "$line" in
+        locked*)
+          status="locked"
+          ;;
+        prunable*)
+          [ "$status" = "ok" ] && status="prunable"
+          ;;
+        detached)
+          [ "$status" = "ok" ] && status="detached"
+          ;;
+      esac
+    fi
+  done <<EOF
+$porcelain_output
+EOF
+
+  # If worktree not found in git's list
+  if [ "$found" -eq 0 ]; then
+    status="missing"
+  fi
+
+  printf "%s" "$status"
+}
+
+# Resolve a worktree target from branch name or special ID '1' for main repo
+# Usage: resolve_target identifier repo_root base_dir prefix
+# Returns: tab-separated "is_main\tpath\tbranch" on success (is_main: 1 for main repo, 0 for worktrees)
+# Exit code: 0 on success, 1 if not found
+resolve_target() {
+  local identifier="$1"
+  local repo_root="$2"
+  local base_dir="$3"
+  local prefix="$4"
+  local id path branch sanitized_name
+
+  # Special case: ID 1 is always the repo root
+  if [ "$identifier" = "1" ]; then
+    path="$repo_root"
+    # Try --show-current (Git 2.22+), fallback to rev-parse for older Git
+    branch=$(git -C "$repo_root" branch --show-current 2>/dev/null)
+    [ -z "$branch" ] && branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    printf "1\t%s\t%s\n" "$path" "$branch"
+    return 0
+  fi
+
+  # For all other identifiers, treat as branch name
+  # First check if it's the current branch in repo root (if not ID 1)
+  branch=$(git -C "$repo_root" branch --show-current 2>/dev/null)
+  [ -z "$branch" ] && branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$branch" = "$identifier" ]; then
+    printf "1\t%s\t%s\n" "$repo_root" "$identifier"
+    return 0
+  fi
+
+  # Try direct path match with sanitized branch name
+  sanitized_name=$(sanitize_branch_name "$identifier")
+  path="$base_dir/${prefix}${sanitized_name}"
+  if [ -d "$path" ]; then
+    branch=$(current_branch "$path")
+    printf "0\t%s\t%s\n" "$path" "$branch"
+    return 0
+  fi
+
+  # Search worktree directories for matching branch (fallback)
+  if [ -d "$base_dir" ]; then
+    for dir in "$base_dir/${prefix}"*; do
+      [ -d "$dir" ] || continue
+      branch=$(current_branch "$dir")
+      if [ "$branch" = "$identifier" ]; then
+        printf "0\t%s\t%s\n" "$dir" "$branch"
+        return 0
+      fi
+    done
+  fi
+
+  log_error "Worktree not found for branch: $identifier"
+  return 1
+}
+
+# Create a new git worktree
+# Usage: create_worktree base_dir prefix branch_name from_ref track_mode [skip_fetch] [force] [custom_name]
+# track_mode: auto, remote, local, or none
+# skip_fetch: 0 (default, fetch) or 1 (skip)
+# force: 0 (default, check branch) or 1 (allow same branch in multiple worktrees)
+# custom_name: optional custom name suffix (e.g., "backend" creates "feature-auth-backend")
+create_worktree() {
+  local base_dir="$1"
+  local prefix="$2"
+  local branch_name="$3"
+  local from_ref="$4"
+  local track_mode="${5:-auto}"
+  local skip_fetch="${6:-0}"
+  local force="${7:-0}"
+  local custom_name="${8:-}"
+  local sanitized_name worktree_path
+
+  # Construct folder name
+  if [ -n "$custom_name" ]; then
+    sanitized_name="$(sanitize_branch_name "$branch_name")-${custom_name}"
+  else
+    sanitized_name=$(sanitize_branch_name "$branch_name")
+  fi
+
+  worktree_path="$base_dir/${prefix}${sanitized_name}"
+  local force_flag=""
+
+  if [ "$force" -eq 1 ]; then
+    force_flag="--force"
+  fi
+
+  # Check if worktree already exists
+  if [ -d "$worktree_path" ]; then
+    log_error "Worktree $sanitized_name already exists at $worktree_path"
+    return 1
+  fi
+
+  # Create base directory if needed
+  mkdir -p "$base_dir"
+
+  # Fetch latest refs (unless --no-fetch)
+  if [ "$skip_fetch" -eq 0 ]; then
+    log_step "Fetching remote branches..."
+    git fetch origin 2>/dev/null || log_warn "Could not fetch from origin"
+  fi
+
+  local remote_exists=0
+  local local_exists=0
+
+  git show-ref --verify --quiet "refs/remotes/origin/$branch_name" && remote_exists=1
+  git show-ref --verify --quiet "refs/heads/$branch_name" && local_exists=1
+
+  case "$track_mode" in
+    remote)
+      # Force use of remote branch
+      if [ "$remote_exists" -eq 1 ]; then
+        log_step "Creating worktree from remote branch origin/$branch_name"
+        if git worktree add $force_flag "$worktree_path" -b "$branch_name" "origin/$branch_name" >&2 || \
+           git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
+          log_info "Worktree created tracking origin/$branch_name"
+          printf "%s" "$worktree_path"
+          return 0
+        fi
+      else
+        log_error "Remote branch origin/$branch_name does not exist"
+        return 1
+      fi
+      ;;
+
+    local)
+      # Force use of local branch
+      if [ "$local_exists" -eq 1 ]; then
+        log_step "Creating worktree from local branch $branch_name"
+        if git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
+          log_info "Worktree created with local branch $branch_name"
+          printf "%s" "$worktree_path"
+          return 0
+        fi
+      else
+        log_error "Local branch $branch_name does not exist"
+        return 1
+      fi
+      ;;
+
+    none)
+      # Create new branch from from_ref
+      log_step "Creating new branch $branch_name from $from_ref"
+      if git worktree add $force_flag "$worktree_path" -b "$branch_name" "$from_ref" >&2; then
+        log_info "Worktree created with new branch $branch_name"
+        printf "%s" "$worktree_path"
+        return 0
+      else
+        log_error "Failed to create worktree with new branch"
+        return 1
+      fi
+      ;;
+
+    auto|*)
+      # Auto-detect best option with proper tracking
+      if [ "$remote_exists" -eq 1 ] && [ "$local_exists" -eq 0 ]; then
+        # Remote exists, no local branch - create local with tracking
+        log_step "Branch '$branch_name' exists on remote"
+
+        # Create tracking branch first for explicit upstream configuration
+        if git branch --track "$branch_name" "origin/$branch_name" 2>/dev/null; then
+          log_info "Created local branch tracking origin/$branch_name"
+        fi
+
+        # Now add worktree using the tracking branch
+        if git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
+          log_info "Worktree created tracking origin/$branch_name"
+          printf "%s" "$worktree_path"
+          return 0
+        fi
+      elif [ "$local_exists" -eq 1 ]; then
+        log_step "Using existing local branch $branch_name"
+        if git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
+          log_info "Worktree created with local branch $branch_name"
+          printf "%s" "$worktree_path"
+          return 0
+        fi
+      else
+        log_step "Creating new branch $branch_name from $from_ref"
+        if git worktree add $force_flag "$worktree_path" -b "$branch_name" "$from_ref" >&2; then
+          log_info "Worktree created with new branch $branch_name"
+          printf "%s" "$worktree_path"
+          return 0
+        fi
+      fi
+      ;;
+  esac
+
+  log_error "Failed to create worktree"
+  return 1
+}
+
+# Remove a git worktree
+# Usage: remove_worktree worktree_path
+remove_worktree() {
+  local worktree_path="$1"
+  local force="${2:-0}"
+
+  if [ ! -d "$worktree_path" ]; then
+    log_error "Worktree not found at $worktree_path"
+    return 1
+  fi
+
+  local force_flag=""
+  if [ "$force" -eq 1 ]; then
+    force_flag="--force"
+  fi
+
+  if git worktree remove $force_flag "$worktree_path" 2>/dev/null; then
+    log_info "Worktree removed: $worktree_path"
+    return 0
+  else
+    log_error "Failed to remove worktree"
+    return 1
+  fi
+}
+
+# List all worktrees
+list_worktrees() {
+  git worktree list
+}
+
+# --- lib/copy.sh ---
+# File copying utilities with pattern matching
+
+# Copy files matching patterns from source to destination
+# Usage: copy_patterns src_root dst_root includes excludes [preserve_paths]
+# includes: newline-separated glob patterns to include
+# excludes: newline-separated glob patterns to exclude
+# preserve_paths: true (default) to preserve directory structure
+copy_patterns() {
+  local src_root="$1"
+  local dst_root="$2"
+  local includes="$3"
+  local excludes="$4"
+  local preserve_paths="${5:-true}"
+
+  if [ -z "$includes" ]; then
+    # No patterns to copy
+    return 0
+  fi
+
+  # Change to source directory
+  local old_pwd
+  old_pwd=$(pwd)
+  cd "$src_root" || return 1
+
+  # Save current shell options
+  local shopt_save
+  shopt_save="$(shopt -p nullglob dotglob globstar 2>/dev/null || true)"
+
+  # Try to enable globstar for ** patterns (Bash 4.0+)
+  # nullglob: patterns that don't match expand to nothing
+  # dotglob: * matches hidden files
+  # globstar: ** matches directories recursively
+  local have_globstar=0
+  if shopt -s globstar 2>/dev/null; then
+    have_globstar=1
+  fi
+  shopt -s nullglob dotglob 2>/dev/null || true
+
+  local copied_count=0
+
+  # Process each include pattern (avoid pipeline subshell)
+  while IFS= read -r pattern; do
+    [ -z "$pattern" ] && continue
+
+    # Security: reject absolute paths and parent directory traversal
+    case "$pattern" in
+      /*|*/../*|../*|*/..|..)
+        log_warn "Skipping unsafe pattern (absolute path or '..' path segment): $pattern"
+        continue
+        ;;
+    esac
+
+    # Detect if pattern uses ** (requires globstar)
+    if [ "$have_globstar" -eq 0 ] && echo "$pattern" | grep -q '\*\*'; then
+      # Fallback to find for ** patterns on Bash 3.2
+      while IFS= read -r file; do
+        # Remove leading ./
+        file="${file#./}"
+
+        # Check if file matches any exclude pattern
+        local excluded=0
+        if [ -n "$excludes" ]; then
+          while IFS= read -r exclude_pattern; do
+            [ -z "$exclude_pattern" ] && continue
+            # Intentional glob pattern matching for file exclusion
+            # shellcheck disable=SC2254
+            case "$file" in
+              $exclude_pattern)
+                excluded=1
+                break
+                ;;
+            esac
+          done <<EOF
+$excludes
+EOF
+        fi
+
+        # Skip if excluded
+        [ "$excluded" -eq 1 ] && continue
+
+        # Determine destination path
+        local dest_file
+        if [ "$preserve_paths" = "true" ]; then
+          dest_file="$dst_root/$file"
+        else
+          dest_file="$dst_root/$(basename "$file")"
+        fi
+
+        # Create destination directory
+        local dest_dir
+        dest_dir=$(dirname "$dest_file")
+        mkdir -p "$dest_dir"
+
+        # Copy the file
+        if cp "$file" "$dest_file" 2>/dev/null; then
+          log_info "Copied $file"
+          copied_count=$((copied_count + 1))
+        else
+          log_warn "Failed to copy $file"
+        fi
+      done <<EOF
+$(find . -path "./$pattern" -type f 2>/dev/null)
+EOF
+    else
+      # Use native Bash glob expansion (supports ** if available)
+      for file in $pattern; do
+        # Skip if not a file
+        [ -f "$file" ] || continue
+
+        # Remove leading ./
+        file="${file#./}"
+
+        # Check if file matches any exclude pattern
+        local excluded=0
+        if [ -n "$excludes" ]; then
+          while IFS= read -r exclude_pattern; do
+            [ -z "$exclude_pattern" ] && continue
+            # Intentional glob pattern matching for file exclusion
+            # shellcheck disable=SC2254
+            case "$file" in
+              $exclude_pattern)
+                excluded=1
+                break
+                ;;
+            esac
+          done <<EOF
+$excludes
+EOF
+        fi
+
+        # Skip if excluded
+        [ "$excluded" -eq 1 ] && continue
+
+        # Determine destination path
+        local dest_file
+        if [ "$preserve_paths" = "true" ]; then
+          dest_file="$dst_root/$file"
+        else
+          dest_file="$dst_root/$(basename "$file")"
+        fi
+
+        # Create destination directory
+        local dest_dir
+        dest_dir=$(dirname "$dest_file")
+        mkdir -p "$dest_dir"
+
+        # Copy the file
+        if cp "$file" "$dest_file" 2>/dev/null; then
+          log_info "Copied $file"
+          copied_count=$((copied_count + 1))
+        else
+          log_warn "Failed to copy $file"
+        fi
+      done
+    fi
+  done <<EOF
+$includes
+EOF
+
+  # Restore previous shell options
+  eval "$shopt_save" 2>/dev/null || true
+
+  cd "$old_pwd" || return 1
+
+  if [ "$copied_count" -gt 0 ]; then
+    log_info "Copied $copied_count file(s)"
+  fi
+
+  return 0
+}
+
+# Copy directories matching patterns (typically git-ignored directories like node_modules)
+# Usage: copy_directories src_root dst_root dir_patterns excludes
+# dir_patterns: newline-separated directory names to copy (e.g., "node_modules", ".venv")
+# excludes: newline-separated directory patterns to exclude (supports globs like "node_modules/.cache")
+# WARNING: This copies entire directories including potentially sensitive files.
+#          Use gtr.copy.excludeDirs to exclude sensitive directories.
+copy_directories() {
+  local src_root="$1"
+  local dst_root="$2"
+  local dir_patterns="$3"
+  local excludes="$4"
+
+  if [ -z "$dir_patterns" ]; then
+    return 0
+  fi
+
+  # Change to source directory
+  local old_pwd
+  old_pwd=$(pwd)
+  cd "$src_root" || return 1
+
+  local copied_count=0
+
+  # Process each directory pattern
+  while IFS= read -r pattern; do
+    [ -z "$pattern" ] && continue
+
+    # Security: reject absolute paths and parent directory traversal
+    case "$pattern" in
+      /*|*/../*|../*|*/..|..)
+        log_warn "Skipping unsafe pattern: $pattern"
+        continue
+        ;;
+    esac
+
+    # Find directories matching the pattern name
+    while IFS= read -r dir_path; do
+      [ -z "$dir_path" ] && continue
+
+      # Remove leading ./
+      dir_path="${dir_path#./}"
+
+      # Check if directory matches any exclude pattern
+      local excluded=0
+      if [ -n "$excludes" ]; then
+        while IFS= read -r exclude_pattern; do
+          [ -z "$exclude_pattern" ] && continue
+
+          # Security: reject absolute paths and parent directory traversal in excludes
+          case "$exclude_pattern" in
+            /*|*/../*|../*|*/..|..)
+              log_warn "Skipping unsafe exclude pattern: $exclude_pattern"
+              continue
+              ;;
+          esac
+
+          # Match full path (supports glob patterns like node_modules/.cache or */cache)
+          # Intentional glob pattern matching for directory exclusion
+          # shellcheck disable=SC2254
+          case "$dir_path" in
+            $exclude_pattern)
+              excluded=1
+              break
+              ;;
+          esac
+        done <<EOF
+$excludes
+EOF
+      fi
+
+      # Skip if excluded
+      [ "$excluded" -eq 1 ] && continue
+
+      # Ensure source directory exists
+      [ ! -d "$dir_path" ] && continue
+
+      # Determine destination
+      local dest_dir="$dst_root/$dir_path"
+      local dest_parent
+      dest_parent=$(dirname "$dest_dir")
+
+      # Create parent directory
+      mkdir -p "$dest_parent"
+
+      # Copy directory (cp -r copies the directory itself into dest_parent)
+      if cp -r "$dir_path" "$dest_parent/" 2>/dev/null; then
+        log_info "Copied directory $dir_path"
+        copied_count=$((copied_count + 1))
+
+        # Remove excluded subdirectories after copying
+        if [ -n "$excludes" ]; then
+          while IFS= read -r exclude_pattern; do
+            [ -z "$exclude_pattern" ] && continue
+
+            # Security: reject absolute paths and parent directory traversal in excludes
+            case "$exclude_pattern" in
+              /*|*/../*|../*|*/..|..)
+                log_warn "Skipping unsafe exclude pattern: $exclude_pattern"
+                continue
+                ;;
+            esac
+
+            # Check if pattern applies to this copied directory
+            # Supports patterns like:
+            #   "node_modules/.cache" - exact path
+            #   "*/.cache" - wildcard prefix (matches any directory)
+            #   "node_modules/*" - wildcard suffix (matches all subdirectories)
+            #   "*/.*" - both (matches all hidden subdirectories in any directory)
+
+            # Only process patterns with directory separators
+            case "$exclude_pattern" in
+              */*)
+                # Extract prefix (before first /) and suffix (after first /)
+                local pattern_prefix="${exclude_pattern%%/*}"
+                local pattern_suffix="${exclude_pattern#*/}"
+
+                # Check if our copied directory matches the prefix pattern
+                # Intentional glob pattern matching for directory prefix
+                # shellcheck disable=SC2254
+                case "$dir_path" in
+                  $pattern_prefix)
+                    # Match! Remove matching subdirectories using suffix pattern
+
+                    # Save current directory
+                    local exclude_old_pwd
+                    exclude_old_pwd=$(pwd)
+
+                    # Change to destination directory for glob expansion
+                    cd "$dest_parent/$dir_path" 2>/dev/null || continue
+
+                    # Enable dotglob to match hidden files with wildcards
+                    local exclude_shopt_save
+                    exclude_shopt_save="$(shopt -p dotglob 2>/dev/null || true)"
+                    shopt -s dotglob 2>/dev/null || true
+
+                    # Expand glob pattern and remove matched paths
+                    local removed_any=0
+                    for matched_path in $pattern_suffix; do
+                      # Check if glob matched anything (avoid literal pattern if no match)
+                      if [ -e "$matched_path" ]; then
+                        rm -rf "$matched_path" 2>/dev/null && removed_any=1 || true
+                      fi
+                    done
+
+                    # Restore shell options and directory
+                    eval "$exclude_shopt_save" 2>/dev/null || true
+                    cd "$exclude_old_pwd" || true
+
+                    # Log only if we actually removed something
+                    [ "$removed_any" -eq 1 ] && log_info "Excluded subdirectory $exclude_pattern" || true
+                    ;;
+                esac
+                ;;
+            esac
+          done <<EOF
+$excludes
+EOF
+        fi
+      else
+        log_warn "Failed to copy directory $dir_path"
+      fi
+    done <<EOF
+$(find . -type d -name "$pattern" 2>/dev/null)
+EOF
+  done <<EOF
+$dir_patterns
+EOF
+
+  cd "$old_pwd" || return 1
+
+  if [ "$copied_count" -gt 0 ]; then
+    log_info "Copied $copied_count directories"
+  fi
+
+  return 0
+}
+
+# Copy a single file, creating directories as needed
+# Usage: copy_file src_file dst_file
+copy_file() {
+  local src="$1"
+  local dst="$2"
+  local dst_dir
+
+  dst_dir=$(dirname "$dst")
+  mkdir -p "$dst_dir"
+
+  if cp "$src" "$dst" 2>/dev/null; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# --- lib/hooks.sh ---
+# Hook execution system
+
+# Run hooks for a specific phase
+# Usage: run_hooks phase [env_vars...]
+# Example: run_hooks postCreate REPO_ROOT="$root" WORKTREE_PATH="$path"
+run_hooks() {
+  local phase="$1"
+  shift
+
+  local hooks
+  hooks=$(cfg_get_all "gtr.hook.$phase")
+
+  if [ -z "$hooks" ]; then
+    # No hooks configured for this phase
+    return 0
+  fi
+
+  log_step "Running $phase hooks..."
+
+  local hook_count=0
+  local failed=0
+
+  # Capture environment variable assignments in array to preserve quoting
+  local envs=("$@")
+
+  # Execute each hook in a subshell to isolate side effects
+  while IFS= read -r hook; do
+    [ -z "$hook" ] && continue
+
+    hook_count=$((hook_count + 1))
+    log_info "Hook $hook_count: $hook"
+
+    # Run hook in subshell with properly quoted environment exports
+    if (
+      # Export each KEY=VALUE exactly as passed, safely quoted
+      for kv in "${envs[@]}"; do
+        export "$kv"
+      done
+      # Execute the hook
+      eval "$hook"
+    ); then
+      log_info "Hook $hook_count completed successfully"
+    else
+      local rc=$?
+      log_error "Hook $hook_count failed with exit code $rc"
+      failed=$((failed + 1))
+    fi
+  done <<EOF
+$hooks
+EOF
+
+  if [ "$failed" -gt 0 ]; then
+    log_warn "$failed hook(s) failed"
+    return 1
+  fi
+
+  return 0
+}
+
+# Run hooks in a specific directory
+# Usage: run_hooks_in phase directory [env_vars...]
+run_hooks_in() {
+  local phase="$1"
+  local directory="$2"
+  shift 2
+
+  local old_pwd
+  old_pwd=$(pwd)
+
+  if [ ! -d "$directory" ]; then
+    log_error "Directory does not exist: $directory"
+    return 1
+  fi
+
+  cd "$directory" || return 1
+
+  run_hooks "$phase" "$@"
+  local result=$?
+
+  cd "$old_pwd" || return 1
+
+  return $result
+}
+
+# ============================================================================
+# EMBEDDED ADAPTERS
+# ============================================================================
+
+# Editor adapter registry
+_gtr_load_editor_adapter_embedded() {
+  local editor="$1"
+  case "$editor" in
+    atom)
+      editor_can_open() {
+        command -v atom >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Atom not found. Install from https://atom.io"
+          return 1
+        fi
+        atom "$path"
+      }
+      return 0
+      ;;
+    cursor)
+      editor_can_open() {
+        command -v cursor >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Cursor not found. Install from https://cursor.com or enable the shell command."
+          return 1
+        fi
+        cursor "$path"
+      }
+      return 0
+      ;;
+    emacs)
+      editor_can_open() {
+        command -v emacs >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Emacs not found. Install from https://www.gnu.org/software/emacs/"
+          return 1
+        fi
+        # Open emacs with the directory
+        emacs "$path" &
+      }
+      return 0
+      ;;
+    idea)
+      editor_can_open() {
+        command -v idea >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "IntelliJ IDEA 'idea' command not found. Enable shell launcher in Tools > Create Command-line Launcher"
+          return 1
+        fi
+        idea "$path"
+      }
+      return 0
+      ;;
+    nano)
+      editor_can_open() {
+        command -v nano >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Nano not found. Usually pre-installed on Unix systems."
+          return 1
+        fi
+        # Open nano in the directory (just cd there, nano doesn't open directories)
+        log_info "Opening shell in $path (nano doesn't support directory mode)"
+        (cd "$path" && exec "$SHELL")
+      }
+      return 0
+      ;;
+    nvim)
+      editor_can_open() {
+        command -v nvim >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Neovim not found. Install from https://neovim.io"
+          return 1
+        fi
+        # Open neovim in the directory
+        (cd "$path" && nvim .)
+      }
+      return 0
+      ;;
+    pycharm)
+      editor_can_open() {
+        command -v pycharm >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "PyCharm 'pycharm' command not found. Enable shell launcher in Tools > Create Command-line Launcher"
+          return 1
+        fi
+        pycharm "$path"
+      }
+      return 0
+      ;;
+    sublime)
+      editor_can_open() {
+        command -v subl >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Sublime Text 'subl' command not found. Install from https://www.sublimetext.com"
+          return 1
+        fi
+        subl "$path"
+      }
+      return 0
+      ;;
+    vim)
+      editor_can_open() {
+        command -v vim >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Vim not found. Install via your package manager."
+          return 1
+        fi
+        # Open vim in the directory
+        (cd "$path" && vim .)
+      }
+      return 0
+      ;;
+    vscode)
+      editor_can_open() {
+        command -v code >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "VS Code 'code' command not found. Install from https://code.visualstudio.com"
+          return 1
+        fi
+        code "$path"
+      }
+      return 0
+      ;;
+    webstorm)
+      editor_can_open() {
+        command -v webstorm >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "WebStorm 'webstorm' command not found. Enable shell launcher in Tools > Create Command-line Launcher"
+          return 1
+        fi
+        webstorm "$path"
+      }
+      return 0
+      ;;
+    zed)
+      editor_can_open() {
+        command -v zed >/dev/null 2>&1
+      }
+      editor_open() {
+        local path="$1"
+        if ! editor_can_open; then
+          log_error "Zed not found. Install from https://zed.dev"
+          return 1
+        fi
+        zed "$path"
+      }
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# AI adapter registry
+_gtr_load_ai_adapter_embedded() {
+  local ai_tool="$1"
+  case "$ai_tool" in
+    aider)
+      ai_can_start() {
+        command -v aider >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        if ! ai_can_start; then
+          log_error "Aider not found. Install with: pip install aider-chat"
+          log_info "See https://aider.chat for more information"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        # Change to the directory and run aider with any additional arguments
+        (cd "$path" && aider "$@")
+      }
+      return 0
+      ;;
+    claude)
+      find_claude_executable() {
+        local cmd
+        # Check common installation paths first
+        if [ -x "$HOME/.claude/local/claude" ]; then
+          echo "$HOME/.claude/local/claude"
+          return 0
+        fi
+        # Try to find executable using type -P (Bash/Zsh)
+        for cmd in claude claude-code; do
+          local exe_path
+          exe_path="$(type -P "$cmd" 2>/dev/null)" && [ -n "$exe_path" ] && {
+            echo "$exe_path"
+            return 0
+          }
+        done
+        # Fallback: use type -t to check if it's an executable file
+        for cmd in claude claude-code; do
+          if [ "$(type -t "$cmd" 2>/dev/null)" = "file" ]; then
+            command -v "$cmd"
+            return 0
+          fi
+        done
+        return 1
+      }
+      ai_can_start() {
+        find_claude_executable >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        local claude_cmd
+        claude_cmd="$(find_claude_executable)"
+        if [ -z "$claude_cmd" ]; then
+          log_error "Claude Code not found. Install from https://claude.com/claude-code"
+          log_info "The CLI is called 'claude' (or 'claude-code' in older versions)"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        (cd "$path" && "$claude_cmd" "$@")
+      }
+      return 0
+      ;;
+    codex)
+      ai_can_start() {
+        command -v codex >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        if ! ai_can_start; then
+          log_error "Codex CLI not found. Install with: npm install -g @openai/codex"
+          log_info "Or: brew install codex"
+          log_info "See https://github.com/openai/codex for more info"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        # Change to the directory and run codex with any additional arguments
+        (cd "$path" && codex "$@")
+      }
+      return 0
+      ;;
+    continue)
+      ai_can_start() {
+        command -v cn >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        if ! ai_can_start; then
+          log_error "Continue CLI not found. Install from https://continue.dev"
+          log_info "See https://docs.continue.dev/cli/install for installation"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        # Change to the directory and run cn with any additional arguments
+        (cd "$path" && cn "$@")
+      }
+      return 0
+      ;;
+    cursor)
+      ai_can_start() {
+        command -v cursor-agent >/dev/null 2>&1 || command -v cursor >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        if ! ai_can_start; then
+          log_error "Cursor not found. Install from https://cursor.com"
+          log_info "Make sure to enable the Cursor CLI/agent from the app"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        # Try cursor-agent first, then fallback to cursor CLI commands
+        if command -v cursor-agent >/dev/null 2>&1; then
+          (cd "$path" && cursor-agent "$@")
+        elif command -v cursor >/dev/null 2>&1; then
+          # Try various Cursor CLI patterns (implementation varies by version)
+          (cd "$path" && cursor cli "$@") 2>/dev/null || (cd "$path" && cursor "$@")
+        fi
+      }
+      return 0
+      ;;
+    gemini)
+      ai_can_start() {
+        command -v gemini >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        if ! ai_can_start; then
+          log_error "Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+          log_info "Or: brew install gemini-cli"
+          log_info "See https://github.com/google-gemini/gemini-cli for more info"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        # Change to the directory and run gemini with any additional arguments
+        (cd "$path" && gemini "$@")
+      }
+      return 0
+      ;;
+    opencode)
+      ai_can_start() {
+        command -v opencode >/dev/null 2>&1
+      }
+      ai_start() {
+        local path="$1"
+        shift
+        if ! ai_can_start; then
+          log_error "OpenCode not found. Install from https://opencode.ai"
+          log_info "Make sure the 'opencode' CLI is available in your PATH"
+          return 1
+        fi
+        if [ ! -d "$path" ]; then
+          log_error "Directory not found: $path"
+          return 1
+        fi
+        # Change to the directory and run opencode with any additional arguments
+        (cd "$path" && opencode "$@")
+      }
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ============================================================================
+# MAIN SCRIPT
+# ============================================================================
+
+# Generic adapter functions (used when no explicit adapter file exists)
+# These will be overridden if an adapter is loaded
+# Globals set by load_editor_adapter: GTR_EDITOR_CMD, GTR_EDITOR_CMD_NAME
+editor_can_open() {
+  command -v "$GTR_EDITOR_CMD_NAME" >/dev/null 2>&1
+}
+
+editor_open() {
+  # $GTR_EDITOR_CMD may contain arguments (e.g., "code --wait")
+  eval "$GTR_EDITOR_CMD \"\$1\""
+}
+
+# Globals set by load_ai_adapter: GTR_AI_CMD, GTR_AI_CMD_NAME
+ai_can_start() {
+  command -v "$GTR_AI_CMD_NAME" >/dev/null 2>&1
+}
+
+ai_start() {
+  local path="$1"
+  shift
+  (cd "$path" && eval "$GTR_AI_CMD \"\$@\"")
+}
+
+# Modified load_editor_adapter for standalone mode
+load_editor_adapter() {
+  local editor="$1"
+
+  # Try loading embedded adapter first
+  if _gtr_load_editor_adapter_embedded "$editor"; then
+    return 0
+  fi
+
+  # Generic fallback: check if command exists in PATH
+  local cmd_name="${editor%% *}"
+
+  if ! command -v "$cmd_name" >/dev/null 2>&1; then
+    log_error "Editor '$editor' not found"
+    log_info "Built-in adapters: cursor, vscode, zed, idea, pycharm, webstorm, vim, nvim, emacs, sublime, nano, atom"
+    log_info "Or use any editor command available in your PATH"
+    exit 1
+  fi
+
+  GTR_EDITOR_CMD="$editor"
+  GTR_EDITOR_CMD_NAME="$cmd_name"
+}
+
+# Modified load_ai_adapter for standalone mode
+load_ai_adapter() {
+  local ai_tool="$1"
+
+  # Try loading embedded adapter first
+  if _gtr_load_ai_adapter_embedded "$ai_tool"; then
+    return 0
+  fi
+
+  # Generic fallback: check if command exists in PATH
+  local cmd_name="${ai_tool%% *}"
+
+  if ! command -v "$cmd_name" >/dev/null 2>&1; then
+    log_error "AI tool '$ai_tool' not found"
+    log_info "Built-in adapters: aider, claude, codex, continue, cursor, gemini, opencode"
+    log_info "Or use any AI tool command available in your PATH"
+    exit 1
+  fi
+
+  GTR_AI_CMD="$ai_tool"
+  GTR_AI_CMD_NAME="$cmd_name"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    new)
+      cmd_create "$@"
+      ;;
+    rm)
+      cmd_remove "$@"
+      ;;
+    go)
+      cmd_go "$@"
+      ;;
+    run)
+      cmd_run "$@"
+      ;;
+    editor)
+      cmd_editor "$@"
+      ;;
+    ai)
+      cmd_ai "$@"
+      ;;
+    ls|list)
+      cmd_list "$@"
+      ;;
+    clean)
+      cmd_clean "$@"
+      ;;
+    doctor)
+      cmd_doctor "$@"
+      ;;
+    adapter|adapters)
+      cmd_adapter "$@"
+      ;;
+    config)
+      cmd_config "$@"
+      ;;
+    version|--version|-v)
+      echo "git gtr version $GTR_VERSION"
+      ;;
+    help|--help|-h)
+      cmd_help
+      ;;
+    *)
+      log_error "Unknown command: $cmd"
+      echo "Use 'git gtr help' for available commands"
+      exit 1
+      ;;
+  esac
+}
+
+# Create command
+cmd_create() {
+  local branch_name=""
+  local from_ref=""
+  local from_current=0
+  local track_mode="auto"
+  local skip_copy=0
+  local skip_fetch=0
+  local yes_mode=0
+  local force=0
+  local custom_name=""
+
+  # Parse flags and arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)
+        from_ref="$2"
+        shift 2
+        ;;
+      --from-current)
+        from_current=1
+        shift
+        ;;
+      --track)
+        track_mode="$2"
+        shift 2
+        ;;
+      --no-copy)
+        skip_copy=1
+        shift
+        ;;
+      --no-fetch)
+        skip_fetch=1
+        shift
+        ;;
+      --yes)
+        yes_mode=1
+        shift
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      --name)
+        custom_name="$2"
+        shift 2
+        ;;
+      -*)
+        log_error "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        # Positional argument: treat as branch name
+        if [ -z "$branch_name" ]; then
+          branch_name="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # Validate flag combinations
+  if [ "$force" -eq 1 ] && [ -z "$custom_name" ]; then
+    log_error "--force requires --name to distinguish worktrees"
+    if [ -n "$branch_name" ]; then
+      echo "Example: git gtr new $branch_name --force --name backend" >&2
+    else
+      echo "Example: git gtr new feature-auth --force --name backend" >&2
+    fi
+    exit 1
+  fi
+
+  # Get repo info
+  local repo_root
+  repo_root=$(discover_repo_root) || exit 1
+
+  local base_dir prefix
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  # Get branch name if not provided
+  if [ -z "$branch_name" ]; then
+    if [ "$yes_mode" -eq 1 ]; then
+      log_error "Branch name required in non-interactive mode"
+      exit 1
+    fi
+    branch_name=$(prompt_input "Enter branch name:")
+    if [ -z "$branch_name" ]; then
+      log_error "Branch name required"
+      exit 1
+    fi
+  fi
+
+  # Determine from_ref with precedence: --from > --from-current > default
+  if [ -z "$from_ref" ]; then
+    if [ "$from_current" -eq 1 ]; then
+      # Get current branch (try modern git first, then fallback)
+      from_ref=$(git branch --show-current 2>/dev/null)
+      if [ -z "$from_ref" ]; then
+        from_ref=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+      fi
+
+      # Handle detached HEAD state
+      if [ -z "$from_ref" ] || [ "$from_ref" = "HEAD" ]; then
+        log_warn "Currently in detached HEAD state - falling back to default branch"
+        from_ref=$(resolve_default_branch "$repo_root")
+      else
+        log_info "Creating from current branch: $from_ref"
+      fi
+    else
+      from_ref=$(resolve_default_branch "$repo_root")
+    fi
+  fi
+
+  # Construct folder name for display
+  local folder_name
+  if [ -n "$custom_name" ]; then
+    folder_name="$(sanitize_branch_name "$branch_name")-${custom_name}"
+  else
+    folder_name=$(sanitize_branch_name "$branch_name")
+  fi
+
+  log_step "Creating worktree: $folder_name"
+  echo "Location: $base_dir/${prefix}${folder_name}"
+  echo "Branch: $branch_name"
+
+  # Create the worktree
+  if ! worktree_path=$(create_worktree "$base_dir" "$prefix" "$branch_name" "$from_ref" "$track_mode" "$skip_fetch" "$force" "$custom_name"); then
+    exit 1
+  fi
+
+  # Copy files based on patterns
+  if [ "$skip_copy" -eq 0 ]; then
+    local includes excludes
+    includes=$(cfg_get_all gtr.copy.include)
+    excludes=$(cfg_get_all gtr.copy.exclude)
+
+    if [ -n "$includes" ]; then
+      log_step "Copying files..."
+      copy_patterns "$repo_root" "$worktree_path" "$includes" "$excludes"
+    fi
+
+    # Copy directories (typically git-ignored dirs like node_modules, .venv)
+    local dir_includes dir_excludes
+    dir_includes=$(cfg_get_all gtr.copy.includeDirs)
+    dir_excludes=$(cfg_get_all gtr.copy.excludeDirs)
+
+    if [ -n "$dir_includes" ]; then
+      log_step "Copying directories..."
+      copy_directories "$repo_root" "$worktree_path" "$dir_includes" "$dir_excludes"
+    fi
+  fi
+
+  # Run post-create hooks
+  run_hooks_in postCreate "$worktree_path" \
+    REPO_ROOT="$repo_root" \
+    WORKTREE_PATH="$worktree_path" \
+    BRANCH="$branch_name"
+
+  echo ""
+  log_info "Worktree created: $worktree_path"
+  echo ""
+  echo "Next steps:"
+  echo "  git gtr editor $branch_name  # Open in editor"
+  echo "  git gtr ai $branch_name      # Start AI tool"
+  echo "  cd \"\$(git gtr go $branch_name)\"  # Navigate to worktree"
+}
+
+# Remove command
+cmd_remove() {
+  local delete_branch=0
+  local yes_mode=0
+  local force=0
+  local identifiers=""
+
+  # Parse flags
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete-branch)
+        delete_branch=1
+        shift
+        ;;
+      --yes)
+        yes_mode=1
+        shift
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      -*)
+        log_error "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        identifiers="$identifiers $1"
+        shift
+        ;;
+    esac
+  done
+
+  if [ -z "$identifiers" ]; then
+    log_error "Usage: git gtr rm <id|branch> [<id|branch>...] [--delete-branch] [--force] [--yes]"
+    exit 1
+  fi
+
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) || exit 1
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  for identifier in $identifiers; do
+    # Resolve target branch
+    local target is_main worktree_path branch_name
+    target=$(resolve_target "$identifier" "$repo_root" "$base_dir" "$prefix") || continue
+    is_main=$(echo "$target" | cut -f1)
+    worktree_path=$(echo "$target" | cut -f2)
+    branch_name=$(echo "$target" | cut -f3)
+
+    # Cannot remove main repository
+    if [ "$is_main" = "1" ]; then
+      log_error "Cannot remove main repository"
+      continue
+    fi
+
+    log_step "Removing worktree: $branch_name"
+
+    # Remove the worktree
+    if ! remove_worktree "$worktree_path" "$force"; then
+      continue
+    fi
+
+    # Handle branch deletion
+    if [ -n "$branch_name" ]; then
+      if [ "$delete_branch" -eq 1 ]; then
+        if [ "$yes_mode" -eq 1 ] || prompt_yes_no "Also delete branch '$branch_name'?"; then
+          if git branch -D "$branch_name" 2>/dev/null; then
+            log_info "Branch deleted: $branch_name"
+          else
+            log_warn "Could not delete branch: $branch_name"
+          fi
+        fi
+      fi
+    fi
+
+    # Run post-remove hooks
+    run_hooks postRemove \
+      REPO_ROOT="$repo_root" \
+      WORKTREE_PATH="$worktree_path" \
+      BRANCH="$branch_name"
+  done
+}
+
+# Go command (navigate to worktree - prints path for shell integration)
+cmd_go() {
+  if [ $# -ne 1 ]; then
+    log_error "Usage: git gtr go <id|branch>"
+    exit 1
+  fi
+
+  local identifier="$1"
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) || exit 1
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  # Resolve target branch
+  local target is_main worktree_path branch
+  target=$(resolve_target "$identifier" "$repo_root" "$base_dir" "$prefix") || exit 1
+  is_main=$(echo "$target" | cut -f1)
+  worktree_path=$(echo "$target" | cut -f2)
+  branch=$(echo "$target" | cut -f3)
+
+  # Human messages to stderr so stdout can be used in command substitution
+  if [ "$is_main" = "1" ]; then
+    echo "Main repo" >&2
+  else
+    echo "Worktree: $branch" >&2
+  fi
+  echo "Branch: $branch" >&2
+
+  # Print path to stdout for shell integration: cd "$(gtr go my-feature)"
+  printf "%s\n" "$worktree_path"
+}
+
+# Run command (execute command in worktree directory)
+cmd_run() {
+  local identifier=""
+  local -a run_args=()
+
+  # Parse arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*)
+        log_error "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        if [ -z "$identifier" ]; then
+          identifier="$1"
+          shift
+        else
+          run_args=("$@")  # Capture all remaining args as the command
+          break
+        fi
+        ;;
+    esac
+  done
+
+  # Validation
+  if [ -z "$identifier" ]; then
+    log_error "Usage: git gtr run <id|branch> <command...>"
+    exit 1
+  fi
+
+  if [ ${#run_args[@]} -eq 0 ]; then
+    log_error "Usage: git gtr run <id|branch> <command...>"
+    log_error "No command specified"
+    exit 1
+  fi
+
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) || exit 1
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  # Resolve target branch
+  local target is_main worktree_path branch
+  target=$(resolve_target "$identifier" "$repo_root" "$base_dir" "$prefix") || exit 1
+  is_main=$(echo "$target" | cut -f1)
+  worktree_path=$(echo "$target" | cut -f2)
+  branch=$(echo "$target" | cut -f3)
+
+  # Human messages to stderr (like cmd_go)
+  if [ "$is_main" = "1" ]; then
+    log_step "Running in: main repo"
+  else
+    log_step "Running in: $branch"
+  fi
+  echo "Command: ${run_args[*]}" >&2
+  echo "" >&2
+
+  # Execute command in worktree directory (exit code propagates)
+  (cd "$worktree_path" && "${run_args[@]}")
+}
+
+# Editor command
+cmd_editor() {
+  local identifier=""
+  local editor=""
+
+  # Parse flags
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --editor)
+        editor="$2"
+        shift 2
+        ;;
+      -*)
+        log_error "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        if [ -z "$identifier" ]; then
+          identifier="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [ -z "$identifier" ]; then
+    log_error "Usage: git gtr editor <id|branch> [--editor <name>]"
+    exit 1
+  fi
+
+  # Get editor from flag or config
+  if [ -z "$editor" ]; then
+    editor=$(cfg_default gtr.editor.default GTR_EDITOR_DEFAULT "none")
+  fi
+
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) || exit 1
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  # Resolve target branch
+  local target worktree_path branch
+  target=$(resolve_target "$identifier" "$repo_root" "$base_dir" "$prefix") || exit 1
+  worktree_path=$(echo "$target" | cut -f2)
+  branch=$(echo "$target" | cut -f3)
+
+  if [ "$editor" = "none" ]; then
+    # Just open in GUI file browser
+    open_in_gui "$worktree_path"
+    log_info "Opened in file browser"
+  else
+    # Load editor adapter and open
+    load_editor_adapter "$editor"
+    log_step "Opening in $editor..."
+    editor_open "$worktree_path"
+  fi
+}
+
+# AI command
+cmd_ai() {
+  local identifier=""
+  local ai_tool=""
+  local -a ai_args=()
+
+  # Parse arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ai)
+        ai_tool="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        ai_args=("$@")
+        break
+        ;;
+      -*)
+        log_error "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        if [ -z "$identifier" ]; then
+          identifier="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [ -z "$identifier" ]; then
+    log_error "Usage: git gtr ai <id|branch> [--ai <name>] [-- args...]"
+    exit 1
+  fi
+
+  # Get AI tool from flag or config
+  if [ -z "$ai_tool" ]; then
+    ai_tool=$(cfg_default gtr.ai.default GTR_AI_DEFAULT "none")
+  fi
+
+  # Check if AI tool is configured
+  if [ "$ai_tool" = "none" ]; then
+    log_error "No AI tool configured"
+    log_info "Set default: git gtr config set gtr.ai.default claude"
+    exit 1
+  fi
+
+  # Load AI adapter
+  load_ai_adapter "$ai_tool"
+
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) || exit 1
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  # Resolve target branch
+  local target worktree_path branch
+  target=$(resolve_target "$identifier" "$repo_root" "$base_dir" "$prefix") || exit 1
+  worktree_path=$(echo "$target" | cut -f2)
+  branch=$(echo "$target" | cut -f3)
+
+  log_step "Starting $ai_tool for: $branch"
+  echo "Directory: $worktree_path"
+  echo "Branch: $branch"
+
+  ai_start "$worktree_path" "${ai_args[@]}"
+}
+
+# List command
+cmd_list() {
+  local porcelain=0
+
+  # Parse flags
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --porcelain)
+        porcelain=1
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) 2>/dev/null || return 0
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  # Machine-readable output (porcelain)
+  if [ "$porcelain" -eq 1 ]; then
+    # Output: path<tab>branch<tab>status
+    local branch status
+    # Try --show-current (Git 2.22+), fallback to rev-parse for older Git
+    branch=$(git -C "$repo_root" branch --show-current 2>/dev/null)
+    [ -z "$branch" ] && branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    [ -z "$branch" ] || [ "$branch" = "HEAD" ] && branch="(detached)"
+    status=$(worktree_status "$repo_root")
+    printf "%s\t%s\t%s\n" "$repo_root" "$branch" "$status"
+
+    if [ -d "$base_dir" ]; then
+      # Find all worktree directories and output: path<tab>branch<tab>status
+      find "$base_dir" -maxdepth 1 -type d -name "${prefix}*" 2>/dev/null | while IFS= read -r dir; do
+        local branch status
+        branch=$(current_branch "$dir")
+        [ -z "$branch" ] && branch="(detached)"
+        status=$(worktree_status "$dir")
+        printf "%s\t%s\t%s\n" "$dir" "$branch" "$status"
+      done | LC_ALL=C sort -k2,2
+    fi
+    return 0
+  fi
+
+  # Human-readable output - table format
+  echo "Git Worktrees"
+  echo ""
+  printf "%-30s %s\n" "BRANCH" "PATH"
+  printf "%-30s %s\n" "------" "----"
+
+  # Always show repo root first
+  local branch
+  # Try --show-current (Git 2.22+), fallback to rev-parse for older Git
+  branch=$(git -C "$repo_root" branch --show-current 2>/dev/null)
+  [ -z "$branch" ] && branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ -z "$branch" ] || [ "$branch" = "HEAD" ] && branch="(detached)"
+  printf "%-30s %s\n" "$branch [main repo]" "$repo_root"
+
+  # Show worktrees sorted by branch name
+  if [ -d "$base_dir" ]; then
+    find "$base_dir" -maxdepth 1 -type d -name "${prefix}*" 2>/dev/null | while IFS= read -r dir; do
+      local branch
+      branch=$(current_branch "$dir")
+      [ -z "$branch" ] && branch="(detached)"
+      printf "%-30s %s\n" "$branch" "$dir"
+    done | LC_ALL=C sort -k1,1
+  fi
+
+  echo ""
+  echo ""
+  echo "Tip: Use 'git gtr list --porcelain' for machine-readable output"
+}
+
+# Clean command (remove prunable worktrees)
+cmd_clean() {
+  log_step "Cleaning up stale worktrees..."
+
+  # Run git worktree prune
+  if git worktree prune 2>/dev/null; then
+    log_info "Pruned stale worktree administrative files"
+  fi
+
+  local repo_root base_dir prefix
+  repo_root=$(discover_repo_root) || exit 1
+  base_dir=$(resolve_base_dir "$repo_root")
+  prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+  if [ ! -d "$base_dir" ]; then
+    log_info "No worktrees directory to clean"
+    return 0
+  fi
+
+  # Find and remove empty directories
+  local cleaned=0
+  local empty_dirs
+  empty_dirs=$(find "$base_dir" -maxdepth 1 -type d -empty 2>/dev/null | grep -v "^${base_dir}$" || true)
+
+  if [ -n "$empty_dirs" ]; then
+    while IFS= read -r dir; do
+      if [ -n "$dir" ]; then
+        if rmdir "$dir" 2>/dev/null; then
+          cleaned=$((cleaned + 1))
+          log_info "Removed empty directory: $(basename "$dir")"
+        fi
+      fi
+    done <<EOF
+$empty_dirs
+EOF
+  fi
+
+  if [ "$cleaned" -gt 0 ]; then
+    log_info "Cleanup complete ($cleaned director$([ "$cleaned" -eq 1 ] && echo 'y' || echo 'ies') removed)"
+  else
+    log_info "Cleanup complete (no empty directories found)"
+  fi
+}
+
+# Doctor command (health check)
+cmd_doctor() {
+  echo "Running git gtr health check..."
+  echo ""
+
+  local issues=0
+
+  # Check git
+  if command -v git >/dev/null 2>&1; then
+    local git_version
+    git_version=$(git --version)
+    echo "[OK] Git: $git_version"
+  else
+    echo "[x] Git: not found"
+    issues=$((issues + 1))
+  fi
+
+  # Check repo
+  local repo_root
+  if repo_root=$(discover_repo_root 2>/dev/null); then
+    echo "[OK] Repository: $repo_root"
+
+    # Check worktree base dir
+    local base_dir prefix
+    base_dir=$(resolve_base_dir "$repo_root")
+    prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+    if [ -d "$base_dir" ]; then
+      local count
+      count=$(find "$base_dir" -maxdepth 1 -type d -name "${prefix}*" 2>/dev/null | wc -l | tr -d ' ')
+      echo "[OK] Worktrees directory: $base_dir ($count worktrees)"
+    else
+      echo "[i] Worktrees directory: $base_dir (not created yet)"
+    fi
+  else
+    echo "[x] Not in a git repository"
+    issues=$((issues + 1))
+  fi
+
+  # Check configured editor
+  local editor
+  editor=$(cfg_default gtr.editor.default GTR_EDITOR_DEFAULT "none")
+  if [ "$editor" != "none" ]; then
+    # Check if adapter exists
+    local editor_adapter="$GTR_DIR/adapters/editor/${editor}.sh"
+    if [ -f "$editor_adapter" ]; then
+      . "$editor_adapter"
+      if editor_can_open 2>/dev/null; then
+        echo "[OK] Editor: $editor (found)"
+      else
+        echo "[!] Editor: $editor (configured but not found in PATH)"
+      fi
+    else
+      echo "[!] Editor: $editor (adapter not found)"
+    fi
+  else
+    echo "[i] Editor: none configured"
+  fi
+
+  # Check configured AI tool
+  local ai_tool
+  ai_tool=$(cfg_default gtr.ai.default GTR_AI_DEFAULT "none")
+  if [ "$ai_tool" != "none" ]; then
+    # Check if adapter exists
+    local adapter_file="$GTR_DIR/adapters/ai/${ai_tool}.sh"
+    if [ -f "$adapter_file" ]; then
+      . "$adapter_file"
+      if ai_can_start 2>/dev/null; then
+        echo "[OK] AI tool: $ai_tool (found)"
+      else
+        echo "[!] AI tool: $ai_tool (configured but not found in PATH)"
+      fi
+    else
+      echo "[!] AI tool: $ai_tool (adapter not found)"
+    fi
+  else
+    echo "[i] AI tool: none configured"
+  fi
+
+  # Check OS
+  local os
+  os=$(detect_os)
+  echo "[OK] Platform: $os"
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    echo "Everything looks good!"
+    return 0
+  else
+    echo "[!] Found $issues issue(s)"
+    return 1
+  fi
+}
+
+# Adapter command (list available adapters)
+
+# Config command
+cmd_config() {
+  local scope="local"
+  local action="" key="" value=""
+
+  # Parse args flexibly: action, key, value, and --global anywhere
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --global|global)
+        scope="global"
+        shift
+        ;;
+      get|set|unset|add)
+        action="$1"
+        shift
+        ;;
+      *)
+        if [ -z "$key" ]; then
+          key="$1"
+          shift
+        elif [ -z "$value" ] && { [ "$action" = "set" ] || [ "$action" = "add" ]; }; then
+          value="$1"
+          shift
+        else
+          # Unknown extra token
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  # Default action is get
+  action="${action:-get}"
+
+  case "$action" in
+    get)
+      if [ -z "$key" ]; then
+        log_error "Usage: git gtr config get <key> [--global]"
+        exit 1
+      fi
+      cfg_get "$key" "$scope"
+      ;;
+    set)
+      if [ -z "$key" ] || [ -z "$value" ]; then
+        log_error "Usage: git gtr config set <key> <value> [--global]"
+        exit 1
+      fi
+      cfg_set "$key" "$value" "$scope"
+      log_info "Config set: $key = $value ($scope)"
+      ;;
+    add)
+      if [ -z "$key" ] || [ -z "$value" ]; then
+        log_error "Usage: git gtr config add <key> <value> [--global]"
+        exit 1
+      fi
+      cfg_add "$key" "$value" "$scope"
+      log_info "Config added: $key = $value ($scope)"
+      ;;
+    unset)
+      if [ -z "$key" ]; then
+        log_error "Usage: git gtr config unset <key> [--global]"
+        exit 1
+      fi
+      cfg_unset "$key" "$scope"
+      log_info "Config unset: $key ($scope)"
+      ;;
+    *)
+      log_error "Unknown config action: $action"
+      log_error "Usage: git gtr config {get|set|add|unset} <key> [value] [--global]"
+      exit 1
+      ;;
+  esac
+}
+
+# Load editor adapter
+
+# Load AI adapter
+
+# Help command
+cmd_help() {
+  cat <<'EOF'
+git gtr - Git worktree runner
+
+PHILOSOPHY: Configuration over flags. Set defaults once, then use simple commands.
+
+────────────────────────────────────────────────────────────────────────────────
+
+QUICK START:
+  cd ~/your-repo                                   # Navigate to git repo first
+  git gtr config set gtr.editor.default cursor     # One-time setup
+  git gtr config set gtr.ai.default claude         # One-time setup
+  git gtr new my-feature                           # Creates worktree in folder "my-feature"
+  git gtr editor my-feature                        # Opens in cursor
+  git gtr ai my-feature                            # Starts claude
+  git gtr rm my-feature                            # Remove when done
+
+────────────────────────────────────────────────────────────────────────────────
+
+KEY CONCEPTS:
+  • Worktree folders are named after the branch name
+  • Main repo is accessible via special ID '1' (e.g., git gtr go 1, git gtr editor 1)
+  • Commands accept branch names to identify worktrees
+    Example: git gtr editor my-feature, git gtr go feature/user-auth
+
+────────────────────────────────────────────────────────────────────────────────
+
+CORE COMMANDS (daily workflow):
+
+  new <branch> [options]
+         Create a new worktree (folder named after branch)
+         --from <ref>: create from specific ref
+         --from-current: create from current branch (for parallel variants)
+         --track <mode>: tracking mode (auto|remote|local|none)
+         --no-copy: skip file copying
+         --no-fetch: skip git fetch
+         --force: allow same branch in multiple worktrees (requires --name)
+         --name <suffix>: custom folder name suffix (e.g., backend, frontend)
+         --yes: non-interactive mode
+
+  editor <branch> [--editor <name>]
+         Open worktree in editor (uses gtr.editor.default or --editor)
+         Special: use '1' to open repo root
+
+  ai <branch> [--ai <name>] [-- args...]
+         Start AI coding tool in worktree (uses gtr.ai.default or --ai)
+         Special: use '1' to open repo root
+
+  go <branch>
+         Navigate to worktree (prints path for: cd "$(git gtr go my-feature)")
+         Special: use '1' for repo root
+
+  run <branch> <command...>
+         Execute command in worktree directory
+         Special: use '1' to run in repo root
+
+         Examples:
+           git gtr run feature npm test
+           git gtr run feature-auth git status
+           git gtr run 1 npm run build
+
+  list [--porcelain]
+         List all worktrees
+         Aliases: ls
+
+  rm <branch> [<branch>...] [options]
+         Remove worktree(s) by branch name
+         --delete-branch: also delete the branch
+         --force: force removal (dirty worktree)
+         --yes: skip confirmation
+
+────────────────────────────────────────────────────────────────────────────────
+
+SETUP & MAINTENANCE:
+
+  config {get|set|add|unset} <key> [value] [--global]
+         Manage configuration
+         - get: read a config value
+         - set: set a single value (replaces existing)
+         - add: add a value (for multi-valued configs like hooks, copy patterns)
+         - unset: remove a config value
+
+  doctor
+         Health check (verify git, editors, AI tools)
+
+  adapter
+         List available editor & AI tool adapters
+         Note: Any command in your PATH can be used (e.g., code-insiders, bunx)
+
+  clean
+         Remove stale/prunable worktrees
+
+  version
+         Show version
+
+────────────────────────────────────────────────────────────────────────────────
+
+WORKFLOW EXAMPLES:
+
+  # One-time repo setup
+  cd ~/GitHub/my-project
+  git gtr config set gtr.editor.default cursor
+  git gtr config set gtr.ai.default claude
+
+  # Daily workflow
+  git gtr new feature/user-auth               # Create worktree (folder: feature-user-auth)
+  git gtr editor feature/user-auth            # Open in editor
+  git gtr ai feature/user-auth                # Start AI tool
+
+  # Run commands in worktree
+  git gtr run feature/user-auth npm test      # Run tests
+  git gtr run feature/user-auth npm run dev   # Start dev server
+
+  # Navigate to worktree directory
+  cd "$(git gtr go feature/user-auth)"
+
+  # Override defaults with flags
+  git gtr editor feature/user-auth --editor vscode
+  git gtr ai feature/user-auth --ai aider
+
+  # Chain commands together
+  git gtr new hotfix && git gtr editor hotfix && git gtr ai hotfix
+
+  # Create variant worktrees from current branch (for parallel work)
+  git checkout feature/user-auth
+  git gtr new variant-1 --from-current        # Creates variant-1 from feature/user-auth
+  git gtr new variant-2 --from-current        # Creates variant-2 from feature/user-auth
+
+  # When finished
+  git gtr rm feature/user-auth --delete-branch
+
+  # Check setup and available tools
+  git gtr doctor
+  git gtr adapter
+
+────────────────────────────────────────────────────────────────────────────────
+
+CONFIGURATION OPTIONS:
+
+  gtr.worktrees.dir        Worktrees base directory
+  gtr.worktrees.prefix     Worktree folder prefix (default: "")
+  gtr.defaultBranch        Default branch (default: auto)
+  gtr.editor.default       Default editor
+                           Options: cursor, vscode, zed, idea, pycharm,
+                           webstorm, vim, nvim, emacs, sublime, nano,
+                           atom, none
+  gtr.ai.default           Default AI tool
+                           Options: aider, claude, codex, continue,
+                           cursor, gemini, opencode, none
+  gtr.copy.include         Files to copy (multi-valued)
+  gtr.copy.exclude         Files to exclude (multi-valued)
+  gtr.copy.includeDirs     Directories to copy (multi-valued)
+                           Example: node_modules, .venv, vendor
+                           WARNING: May include sensitive files!
+                           Use gtr.copy.excludeDirs to exclude them.
+  gtr.copy.excludeDirs     Directories to exclude (multi-valued)
+                           Supports glob patterns (e.g., "node_modules/.cache", "*/.npm")
+  gtr.hook.postCreate      Post-create hooks (multi-valued)
+  gtr.hook.postRemove      Post-remove hooks (multi-valued)
+
+────────────────────────────────────────────────────────────────────────────────
+
+MORE INFO: https://github.com/coderabbitai/git-worktree-runner
+EOF
+}
+
+# Run main
+
+# Adapter command (standalone version with embedded adapters)
+cmd_adapter() {
+  echo "Available Adapters"
+  echo ""
+
+  echo "Editor Adapters:"
+  echo ""
+  printf "%-15s %-15s %s\n" "NAME" "STATUS" "NOTES"
+  printf "%-15s %-15s %s\n" "---------------" "---------------" "-----"
+
+  for adapter_name in atom cursor emacs idea nano nvim pycharm sublime vim vscode webstorm zed; do
+    if _gtr_load_editor_adapter_embedded "$adapter_name"; then
+      if editor_can_open 2>/dev/null; then
+        printf "%-15s %-15s %s\n" "$adapter_name" "[ready]" ""
+      else
+        printf "%-15s %-15s %s\n" "$adapter_name" "[missing]" "Not found in PATH"
+      fi
+    fi
+  done
+
+  echo ""
+  echo ""
+  echo "AI Tool Adapters:"
+  echo ""
+  printf "%-15s %-15s %s\n" "NAME" "STATUS" "NOTES"
+  printf "%-15s %-15s %s\n" "---------------" "---------------" "-----"
+
+  for adapter_name in aider claude codex continue cursor gemini opencode; do
+    if _gtr_load_ai_adapter_embedded "$adapter_name"; then
+      if ai_can_start 2>/dev/null; then
+        printf "%-15s %-15s %s\n" "$adapter_name" "[ready]" ""
+      else
+        printf "%-15s %-15s %s\n" "$adapter_name" "[missing]" "Not found in PATH"
+      fi
+    fi
+  done
+
+  echo ""
+  echo ""
+  echo "Tip: Set defaults with:"
+  echo "   git gtr config set gtr.editor.default <name>"
+  echo "   git gtr config set gtr.ai.default <name>"
+}
+
+# Run main
+main "$@"
