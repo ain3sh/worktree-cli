@@ -76,6 +76,15 @@ check_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Create a temporary file path
+make_temp_file() {
+  if check_command mktemp; then
+    mktemp "${TMPDIR:-/tmp}/git-gtr.XXXXXX"
+  else
+    echo "${TMPDIR:-/tmp}/git-gtr.$$"
+  fi
+}
+
 # Check Bash version
 check_bash() {
   local bash_major="${BASH_VERSINFO[0]}"
@@ -209,6 +218,36 @@ find_source_file() {
   return 1
 }
 
+# Download git-gtr when the installer is run standalone
+download_source_file() {
+  local download_url="${GIT_GTR_DOWNLOAD_URL:-https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr}"
+  local temp_file
+
+  if check_command curl; then
+    temp_file=$(make_temp_file)
+    if curl -fsSL "$download_url" -o "$temp_file"; then
+      chmod +x "$temp_file"
+      echo "$temp_file"
+      return 0
+    fi
+    rm -f "$temp_file"
+    return 1
+  fi
+
+  if check_command wget; then
+    temp_file=$(make_temp_file)
+    if wget -qO "$temp_file" "$download_url"; then
+      chmod +x "$temp_file"
+      echo "$temp_file"
+      return 0
+    fi
+    rm -f "$temp_file"
+    return 1
+  fi
+
+  return 1
+}
+
 # Main installation
 main() {
   echo ""
@@ -258,14 +297,25 @@ main() {
 
   # Find the git-gtr executable
   local source_file
+  local source_is_temp=0
   if ! source_file=$(find_source_file); then
-    log_error "git-gtr executable not found"
-    echo "  Expected locations:"
-    echo "    - ./git-gtr (repo root)"
-    echo "    - ../git-gtr (if running from scripts/)"
-    exit 1
+    log_warn "git-gtr executable not found locally; downloading standalone binary..."
+
+    if ! source_file=$(download_source_file); then
+      log_error "Failed to download git-gtr"
+      echo "  Expected local locations:"
+      echo "    - ./git-gtr (repo root)"
+      echo "    - ../git-gtr (if running from scripts/)"
+      echo "  Download URL: ${GIT_GTR_DOWNLOAD_URL:-https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr}"
+      echo "  Make sure curl or wget is installed, or set GIT_GTR_DOWNLOAD_URL explicitly"
+      exit 1
+    fi
+
+    source_is_temp=1
+    log_info "Downloaded git-gtr to temporary file"
+  else
+    source_file="$(cd "$(dirname "$source_file")" && pwd)/$(basename "$source_file")"
   fi
-  source_file="$(cd "$(dirname "$source_file")" && pwd)/$(basename "$source_file")"
 
   # Get install directory
   local install_dir
@@ -309,6 +359,10 @@ main() {
     sudo chmod +x "$install_path"
   fi
 
+  if [ "$source_is_temp" -eq 1 ]; then
+    rm -f "$source_file"
+  fi
+
   log_info "Installed: $install_path"
 
   # Check if install_dir is in PATH
@@ -321,17 +375,19 @@ main() {
 
     # Detect shell and give appropriate advice
     local shell_name
+    local escaped_install_dir
     shell_name=$(basename "${SHELL:-bash}")
+    escaped_install_dir=$(printf '%q' "$install_dir")
     case "$shell_name" in
       zsh)
-        echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+        echo "    echo 'export PATH=\"$escaped_install_dir:\$PATH\"' >> ~/.zshrc"
         echo "    source ~/.zshrc"
         ;;
       fish)
-        echo "    fish_add_path ~/.local/bin"
+        echo "    fish_add_path $escaped_install_dir"
         ;;
       *)
-        echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+        echo "    echo 'export PATH=\"$escaped_install_dir:\$PATH\"' >> ~/.bashrc"
         echo "    source ~/.bashrc"
         ;;
     esac
