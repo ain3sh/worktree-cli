@@ -58,6 +58,15 @@ jobs:
           INPUT_VERSION="${{ inputs.version }}"
           INPUT_CREATE_RELEASE="${{ inputs.create_release }}"
 
+          # gh workflow run may provide empty string for boolean defaults.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -z "$INPUT_CREATE_RELEASE" ]; then
+            INPUT_CREATE_RELEASE="true"
+          fi
+          INPUT_CREATE_RELEASE="$(printf '%s' "$INPUT_CREATE_RELEASE" | tr '[:upper:]' '[:lower:]')"
+
+          # Ensure we have an up-to-date local tag view for release gating.
+          git fetch --force --tags origin
+
           if [ -n "$INPUT_VERSION" ]; then
             VERSION="$INPUT_VERSION"
             RELEASE_REASON="manual-version"
@@ -79,8 +88,12 @@ jobs:
 
           if [ "$EVENT_NAME" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             SHOULD_RELEASE="true"
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_CREATE_RELEASE" = "true" ]; then
-            SHOULD_RELEASE="true"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_CREATE_RELEASE" != "false" ]; then
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "Tag $TAG already exists; skipping release"
+            else
+              SHOULD_RELEASE="true"
+            fi
           elif [ "$EVENT_NAME" = "schedule" ]; then
             if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
               echo "Tag $TAG already exists; skipping release"
@@ -155,7 +168,7 @@ jobs:
           name: worktree-cli v${{ needs.build.outputs.version }}
           tag_name: ${{ needs.build.outputs.tag }}
           generate_release_notes: true
-          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          draft: false
           files: |
             release/worktree-cli
             release/git-gtr
