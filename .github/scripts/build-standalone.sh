@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# Build script for standalone git-gtr executable
+# Build script for standalone worktree-cli executable
 # This merges all shell files from git-worktree-runner into a single portable script
 #
 # Usage:
-#   .github/scripts/build-standalone.sh [--source-dir <path>] [--output <path>]
+#   .github/scripts/build-standalone.sh [--source-dir <path>] [--output <path>] [--shim-output <path>]
 #
 # Options:
 #   --source-dir  Path to git-worktree-runner source (default: clones from GitHub)
-#   --output      Output file path (default: ./git-gtr)
+#   --output      Output binary path (default: ./worktree-cli)
+#   --shim-output Output git-gtr compatibility shim path (default: ./git-gtr)
 #
 
 set -e
@@ -18,7 +19,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Defaults
 SOURCE_DIR=""
-OUTPUT_FILE="${REPO_ROOT}/git-gtr"
+OUTPUT_FILE="${REPO_ROOT}/worktree-cli"
+SHIM_FILE="${REPO_ROOT}/git-gtr"
 CLEANUP_SOURCE=0
 
 # Parse arguments
@@ -32,12 +34,17 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_FILE="$2"
       shift 2
       ;;
+    --shim-output)
+      SHIM_FILE="$2"
+      shift 2
+      ;;
     -h|--help)
-      echo "Usage: $0 [--source-dir <path>] [--output <path>]"
+      echo "Usage: $0 [--source-dir <path>] [--output <path>] [--shim-output <path>]"
       echo ""
       echo "Options:"
       echo "  --source-dir  Path to git-worktree-runner source (default: clones from GitHub)"
-      echo "  --output      Output file path (default: ./git-gtr)"
+      echo "  --output      Output binary path (default: ./worktree-cli)"
+      echo "  --shim-output Output git-gtr compatibility shim path (default: ./git-gtr)"
       exit 0
       ;;
     *)
@@ -55,26 +62,40 @@ if [ -z "$SOURCE_DIR" ]; then
   git clone --depth 1 https://github.com/coderabbitai/git-worktree-runner.git "$SOURCE_DIR" 2>/dev/null
 fi
 
-# Verify source directory
-if [ ! -f "$SOURCE_DIR/bin/gtr" ]; then
-  echo "Error: Invalid source directory - bin/gtr not found" >&2
+# Verify source directory and select entrypoint
+MAIN_ENTRY=""
+if [ -f "$SOURCE_DIR/bin/git-gtr" ]; then
+  MAIN_ENTRY="$SOURCE_DIR/bin/git-gtr"
+elif [ -f "$SOURCE_DIR/bin/gtr" ]; then
+  MAIN_ENTRY="$SOURCE_DIR/bin/gtr"
+else
+  echo "Error: Invalid source directory - expected bin/git-gtr or bin/gtr" >&2
   exit 1
 fi
 
-VERSION=$(grep 'GTR_VERSION=' "${SOURCE_DIR}/bin/gtr" | head -1 | cut -d'"' -f2)
+VERSION=$(grep -E 'GTR_VERSION=' "${MAIN_ENTRY}" | head -1 | sed -E 's/.*GTR_VERSION="?([^" ]+)"?.*/\1/' || true)
+if [ -z "$VERSION" ]; then
+  VERSION=$(bash "${MAIN_ENTRY}" --version 2>/dev/null | awk '{print $NF}' || true)
+fi
+if [ -z "$VERSION" ]; then
+  echo "Error: Unable to determine upstream version" >&2
+  exit 1
+fi
 
-echo "Building git-gtr standalone v${VERSION}..."
+echo "Building worktree-cli standalone v${VERSION}..."
 echo "  Source: $SOURCE_DIR"
 echo "  Output: $OUTPUT_FILE"
+echo "  Shim:   $SHIM_FILE"
 
 # Create output directory if needed
 mkdir -p "$(dirname "$OUTPUT_FILE")"
+mkdir -p "$(dirname "$SHIM_FILE")"
 
 # Start building the bundled script
 cat > "$OUTPUT_FILE" << 'HEADER'
 #!/usr/bin/env bash
 #
-# git-gtr - Git Worktree Runner (Standalone Edition)
+# worktree-cli - Git Worktree Runner (Standalone Edition)
 # https://github.com/coderabbitai/git-worktree-runner
 #
 # This is a single-file distribution that bundles all dependencies.
@@ -88,6 +109,7 @@ set -e
 # ============================================================================
 
 GTR_STANDALONE=1
+GTR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 check_dependencies() {
   local missing=0
@@ -174,12 +196,72 @@ echo "# EMBEDDED LIBRARIES" >> "$OUTPUT_FILE"
 echo "# ============================================================================" >> "$OUTPUT_FILE"
 echo "" >> "$OUTPUT_FILE"
 
-for lib in ui config platform core copy hooks; do
+for lib in ui args config platform core copy hooks provider adapters launch; do
+  [ -f "${SOURCE_DIR}/lib/${lib}.sh" ] || continue
   echo "# --- lib/${lib}.sh ---" >> "$OUTPUT_FILE"
-  # Strip shebang and leading comments, keep the code
-  tail -n +2 "${SOURCE_DIR}/lib/${lib}.sh" >> "$OUTPUT_FILE"
+  # Strip shebang, then remove dead functions from vendored upstream libs.
+  python3 - "${SOURCE_DIR}/lib/${lib}.sh" <<'PY' >> "$OUTPUT_FILE"
+from pathlib import Path
+import re
+import sys
+
+DEAD = {"cfg_bool", "spawn_terminal_in", "list_worktrees", "copy_file"}
+source_file = Path(sys.argv[1])
+lines = source_file.read_text().splitlines(keepends=True)
+
+if lines and lines[0].startswith("#!"):
+    lines = lines[1:]
+
+out = []
+i = 0
+
+while i < len(lines):
+    line = lines[i]
+    m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{$', line)
+    if m and m.group(1) in DEAD:
+        depth = line.count('{') - line.count('}')
+        i += 1
+        while i < len(lines) and depth > 0:
+            depth += lines[i].count('{') - lines[i].count('}')
+            i += 1
+        while i < len(lines) and lines[i].strip() == "":
+            i += 1
+        continue
+
+    out.append(line)
+    i += 1
+
+sys.stdout.write("".join(out))
+PY
   echo "" >> "$OUTPUT_FILE"
 done
+
+# ============================================================================
+# EMBED COMMAND HANDLERS
+# ============================================================================
+
+echo "# ============================================================================" >> "$OUTPUT_FILE"
+echo "# EMBEDDED COMMANDS" >> "$OUTPUT_FILE"
+echo "# ============================================================================" >> "$OUTPUT_FILE"
+echo "" >> "$OUTPUT_FILE"
+
+if [ -d "${SOURCE_DIR}/lib/commands" ]; then
+  for cmd_file in "${SOURCE_DIR}"/lib/commands/*.sh; do
+    [ -f "$cmd_file" ] || continue
+    echo "# --- lib/commands/$(basename "$cmd_file") ---" >> "$OUTPUT_FILE"
+    python3 - "$cmd_file" <<'PY' >> "$OUTPUT_FILE"
+from pathlib import Path
+import sys
+
+source_file = Path(sys.argv[1])
+lines = source_file.read_text().splitlines(keepends=True)
+if lines and lines[0].startswith("#!"):
+    lines = lines[1:]
+sys.stdout.write("".join(lines))
+PY
+    echo "" >> "$OUTPUT_FILE"
+  done
+fi
 
 # ============================================================================
 # EMBED ADAPTERS AS FUNCTIONS
@@ -273,9 +355,16 @@ ai_start() {
 # Modified load_editor_adapter for standalone mode
 load_editor_adapter() {
   local editor="$1"
+  local entry
 
   # Try loading embedded adapter first
   if _gtr_load_editor_adapter_embedded "$editor"; then
+    return 0
+  fi
+
+  # Try upstream registry-based adapter definitions
+  if entry=$(_registry_lookup "$_EDITOR_REGISTRY" "$editor" 2>/dev/null); then
+    _load_from_editor_registry "$entry"
     return 0
   fi
 
@@ -283,10 +372,12 @@ load_editor_adapter() {
   local cmd_name="${editor%% *}"
 
   if ! command -v "$cmd_name" >/dev/null 2>&1; then
+    local builtin_names
+    builtin_names="$(_list_registry_names "$_EDITOR_REGISTRY")"
     log_error "Editor '$editor' not found"
-    log_info "Built-in adapters: cursor, vscode, zed, idea, pycharm, webstorm, vim, nvim, emacs, sublime, nano, atom"
+    log_info "Built-in adapters: $builtin_names"
     log_info "Or use any editor command available in your PATH"
-    exit 1
+    return 1
   fi
 
   GTR_EDITOR_CMD="$editor"
@@ -296,9 +387,16 @@ load_editor_adapter() {
 # Modified load_ai_adapter for standalone mode
 load_ai_adapter() {
   local ai_tool="$1"
+  local entry
 
   # Try loading embedded adapter first
   if _gtr_load_ai_adapter_embedded "$ai_tool"; then
+    return 0
+  fi
+
+  # Try upstream registry-based adapter definitions
+  if entry=$(_registry_lookup "$_AI_REGISTRY" "$ai_tool" 2>/dev/null); then
+    _load_from_ai_registry "$entry"
     return 0
   fi
 
@@ -306,10 +404,12 @@ load_ai_adapter() {
   local cmd_name="${ai_tool%% *}"
 
   if ! command -v "$cmd_name" >/dev/null 2>&1; then
+    local builtin_names
+    builtin_names="$(_list_registry_names "$_AI_REGISTRY")"
     log_error "AI tool '$ai_tool' not found"
-    log_info "Built-in adapters: aider, claude, codex, continue, cursor, gemini, opencode"
+    log_info "Built-in adapters: $builtin_names"
     log_info "Or use any AI tool command available in your PATH"
-    exit 1
+    return 1
   fi
 
   GTR_AI_CMD="$ai_tool"
@@ -319,7 +419,7 @@ load_ai_adapter() {
 GENERIC_ADAPTERS
 
 # Extract main script (from main() to end, excluding functions we replaced)
-main_start=$(grep -n '^main()' "${SOURCE_DIR}/bin/gtr" | cut -d: -f1)
+main_start=$(grep -n '^main()' "${MAIN_ENTRY}" | cut -d: -f1)
 
 awk -v start="$main_start" '
   NR >= start {
@@ -330,7 +430,7 @@ awk -v start="$main_start" '
     if (/^main "\$@"$/) { next }
     if (!skip) print
   }
-' "${SOURCE_DIR}/bin/gtr" >> "$OUTPUT_FILE"
+' "${MAIN_ENTRY}" | sed 's/git gtr/worktree-cli/g' >> "$OUTPUT_FILE"
 
 # Add standalone-compatible cmd_adapter function
 # Use the actual discovered adapters
@@ -346,7 +446,24 @@ cmd_adapter() {
   printf "%-15s %-15s %s\n" "NAME" "STATUS" "NOTES"
   printf "%-15s %-15s %s\n" "---------------" "---------------" "-----"
 
+  local listed=" "
+  local line adapter_name
+  while IFS= read -r line; do
+    [ -z "\$line" ] && continue
+    adapter_name="\${line%%|*}"
+    listed="\$listed\$adapter_name "
+    _load_from_editor_registry "\$line"
+    if editor_can_open 2>/dev/null; then
+      printf "%-15s %-15s %s\n" "\$adapter_name" "[ready]" ""
+    else
+      printf "%-15s %-15s %s\n" "\$adapter_name" "[missing]" "Not found in PATH"
+    fi
+  done <<EOF
+\$_EDITOR_REGISTRY
+EOF
+
   for adapter_name in${EDITOR_ADAPTERS}; do
+    case "\$listed" in *" \$adapter_name "*) continue ;; esac
     if _gtr_load_editor_adapter_embedded "\$adapter_name"; then
       if editor_can_open 2>/dev/null; then
         printf "%-15s %-15s %s\n" "\$adapter_name" "[ready]" ""
@@ -363,7 +480,23 @@ cmd_adapter() {
   printf "%-15s %-15s %s\n" "NAME" "STATUS" "NOTES"
   printf "%-15s %-15s %s\n" "---------------" "---------------" "-----"
 
+  listed=" "
+  while IFS= read -r line; do
+    [ -z "\$line" ] && continue
+    adapter_name="\${line%%|*}"
+    listed="\$listed\$adapter_name "
+    _load_from_ai_registry "\$line"
+    if ai_can_start 2>/dev/null; then
+      printf "%-15s %-15s %s\n" "\$adapter_name" "[ready]" ""
+    else
+      printf "%-15s %-15s %s\n" "\$adapter_name" "[missing]" "Not found in PATH"
+    fi
+  done <<EOF
+\$_AI_REGISTRY
+EOF
+
   for adapter_name in${AI_ADAPTERS}; do
+    case "\$listed" in *" \$adapter_name "*) continue ;; esac
     if _gtr_load_ai_adapter_embedded "\$adapter_name"; then
       if ai_can_start 2>/dev/null; then
         printf "%-15s %-15s %s\n" "\$adapter_name" "[ready]" ""
@@ -376,18 +509,129 @@ cmd_adapter() {
   echo ""
   echo ""
   echo "Tip: Set defaults with:"
-  echo "   git gtr config set gtr.editor.default <name>"
-  echo "   git gtr config set gtr.ai.default <name>"
+  echo "   worktree-cli config set gtr.editor.default <name>"
+  echo "   worktree-cli config set gtr.ai.default <name>"
 }
 CMD_ADAPTER_STANDALONE
+
+# Doctor command (standalone-safe adapter checks)
+cat >> "$OUTPUT_FILE" << 'CMD_DOCTOR_STANDALONE'
+cmd_doctor() {
+  echo "Running worktree-cli health check..."
+  echo ""
+
+  local issues=0
+
+  if command -v git >/dev/null 2>&1; then
+    local git_version
+    git_version=$(git --version)
+    echo "[OK] Git: $git_version"
+  else
+    echo "[x] Git: not found"
+    issues=$((issues + 1))
+  fi
+
+  local repo_root
+  if repo_root=$(discover_repo_root 2>/dev/null); then
+    echo "[OK] Repository: $repo_root"
+
+    local base_dir prefix
+    base_dir=$(resolve_base_dir "$repo_root")
+    prefix=$(cfg_default gtr.worktrees.prefix GTR_WORKTREES_PREFIX "")
+
+    if [ -d "$base_dir" ]; then
+      local count
+      count=$(find "$base_dir" -maxdepth 1 -type d -name "${prefix}*" 2>/dev/null | wc -l | tr -d ' ')
+      echo "[OK] Worktrees directory: $base_dir ($count worktrees)"
+    else
+      echo "[i] Worktrees directory: $base_dir (not created yet)"
+    fi
+  else
+    echo "[x] Not in a git repository"
+    issues=$((issues + 1))
+  fi
+
+  local editor
+  editor=$(cfg_default gtr.editor.default GTR_EDITOR_DEFAULT "none")
+  if [ "$editor" != "none" ]; then
+    local editor_cmd="${editor%% *}"
+    if _gtr_load_editor_adapter_embedded "$editor" 2>/dev/null; then
+      if editor_can_open 2>/dev/null; then
+        echo "[OK] Editor: $editor (found)"
+      else
+        echo "[!] Editor: $editor (configured but not found in PATH)"
+      fi
+    elif command -v "$editor_cmd" >/dev/null 2>&1; then
+      echo "[OK] Editor: $editor (found)"
+    else
+      echo "[!] Editor: $editor (configured but not found in PATH)"
+    fi
+  else
+    echo "[i] Editor: none configured"
+  fi
+
+  local ai_tool
+  ai_tool=$(cfg_default gtr.ai.default GTR_AI_DEFAULT "none")
+  if [ "$ai_tool" != "none" ]; then
+    local ai_cmd="${ai_tool%% *}"
+    if _gtr_load_ai_adapter_embedded "$ai_tool" 2>/dev/null; then
+      if ai_can_start 2>/dev/null; then
+        echo "[OK] AI tool: $ai_tool (found)"
+      else
+        echo "[!] AI tool: $ai_tool (configured but not found in PATH)"
+      fi
+    elif command -v "$ai_cmd" >/dev/null 2>&1; then
+      echo "[OK] AI tool: $ai_tool (found)"
+    else
+      echo "[!] AI tool: $ai_tool (configured but not found in PATH)"
+    fi
+  else
+    echo "[i] AI tool: none configured"
+  fi
+
+  local os
+  os=$(detect_os)
+  echo "[OK] Platform: $os"
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    echo "Everything looks good!"
+    return 0
+  fi
+
+  echo "[!] Found $issues issue(s)"
+  return 1
+}
+CMD_DOCTOR_STANDALONE
 
 # Add the main invocation at the very end
 echo '' >> "$OUTPUT_FILE"
 echo '# Run main' >> "$OUTPUT_FILE"
 echo 'main "$@"' >> "$OUTPUT_FILE"
 
+# Rebrand user-facing command text across embedded command handlers/help.
+python3 - "$OUTPUT_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+had_trailing_newline = text.endswith("\n")
+text = text.replace("git gtr", "worktree-cli")
+text = text.replace("git-gtr", "worktree-cli")
+lines = text.splitlines()
+text = "\n".join(line.rstrip(" \t") for line in lines)
+if had_trailing_newline:
+    text += "\n"
+path.write_text(text)
+PY
+
 # Make executable
 chmod +x "$OUTPUT_FILE"
+
+# Keep a full git-gtr compatibility binary to preserve old update/install paths.
+cp "$OUTPUT_FILE" "$SHIM_FILE"
+chmod +x "$SHIM_FILE"
 
 # Cleanup temp directory if we cloned
 if [ "$CLEANUP_SOURCE" -eq 1 ]; then
@@ -401,5 +645,6 @@ lines=$(wc -l < "$OUTPUT_FILE" | tr -d ' ')
 echo ""
 echo "Build complete!"
 echo "  Output: $OUTPUT_FILE"
+echo "  Shim: $SHIM_FILE"
 echo "  Size: ${lines} lines, ${size} bytes"
 echo "  Version: ${VERSION}"

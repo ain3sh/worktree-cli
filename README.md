@@ -2,6 +2,9 @@
 
 A standalone, single-file distribution of [git-worktree-runner](https://github.com/coderabbitai/git-worktree-runner) — manage git worktrees with ease.
 
+Primary binary: `worktree-cli`
+Backward compatibility: `git gtr` continues to work via the installed `git-gtr` shim.
+
 ## Install
 
 ```bash
@@ -15,7 +18,14 @@ curl -fsSL https://raw.githubusercontent.com/ain3sh/worktree-cli/main/scripts/in
 Or download directly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr -o ~/.local/bin/git-gtr
+curl -fsSL https://github.com/ain3sh/worktree-cli/releases/latest/download/worktree-cli -o ~/.local/bin/worktree-cli
+chmod +x ~/.local/bin/worktree-cli
+
+# Optional compatibility shim for `git gtr`
+cat > ~/.local/bin/git-gtr <<'EOF'
+#!/usr/bin/env bash
+exec "$(dirname "$0")/worktree-cli" "$@"
+EOF
 chmod +x ~/.local/bin/git-gtr
 ```
 
@@ -25,14 +35,17 @@ chmod +x ~/.local/bin/git-gtr
 
 ```bash
 # One-time setup (in your repo)
-git gtr config set gtr.editor.default cursor
-git gtr config set gtr.ai.default claude
+worktree-cli config set gtr.editor.default cursor
+worktree-cli config set gtr.ai.default claude
 
 # Daily workflow
-git gtr new my-feature        # Create worktree
-git gtr editor my-feature     # Open in editor
-git gtr ai my-feature         # Start AI tool
-git gtr rm my-feature         # Clean up when done
+worktree-cli new my-feature        # Create worktree
+worktree-cli editor my-feature     # Open in editor
+worktree-cli ai my-feature         # Start AI tool
+worktree-cli rm my-feature         # Clean up when done
+
+# Optional convenience alias
+alias gwk='worktree-cli'
 ```
 
 ## Commands
@@ -43,7 +56,7 @@ git gtr rm my-feature         # Clean up when done
 | `rm <branch>` | Remove a worktree |
 | `editor <branch>` | Open worktree in your editor |
 | `ai <branch>` | Start AI coding tool in worktree |
-| `go <branch>` | Print worktree path (use with `cd "$(git gtr go branch)"`) |
+| `go <branch>` | Print worktree path (use with `cd "$(worktree-cli go branch)"`) |
 | `run <branch> <cmd>` | Run a command inside the worktree |
 | `list` | List all worktrees |
 | `config` | Get/set configuration |
@@ -51,29 +64,29 @@ git gtr rm my-feature         # Clean up when done
 | `adapter` | List available editor & AI adapters |
 | `clean` | Remove stale worktrees |
 
-Use `git gtr help` for full details and options.
+Use `worktree-cli help` for full details and options.
 
 ### Command Examples
 
 ```bash
 # Create worktree from a specific branch
-git gtr new feature-auth --from develop
+worktree-cli new feature-auth --from develop
 
 # Create parallel worktrees from current branch
-git gtr new experiment-1 --from-current
-git gtr new experiment-2 --from-current
+worktree-cli new experiment-1 --from-current
+worktree-cli new experiment-2 --from-current
 
 # Run tests in a worktree
-git gtr run feature-auth npm test
+worktree-cli run feature-auth npm test
 
 # Navigate to a worktree
-cd "$(git gtr go feature-auth)"
+cd "$(worktree-cli go feature-auth)"
 
 # Remove worktree and delete the branch
-git gtr rm feature-auth --delete-branch
+worktree-cli rm feature-auth --delete-branch
 
 # Open main repo (use '1' as identifier)
-git gtr editor 1
+worktree-cli editor 1
 ```
 
 ## Configuration
@@ -90,11 +103,11 @@ Configuration is stored via `git config`. Set per-repo (default) or globally wit
 
 ```bash
 # Examples
-git gtr config set gtr.editor.default vscode
-git gtr config set gtr.ai.default aider --global
-git gtr config add gtr.copy.include ".env"
-git gtr config add gtr.copy.include ".env.local"
-git gtr config add gtr.hook.postCreate "npm install"
+worktree-cli config set gtr.editor.default vscode
+worktree-cli config set gtr.ai.default aider --global
+worktree-cli config add gtr.copy.include ".env"
+worktree-cli config add gtr.copy.include ".env.local"
+worktree-cli config add gtr.hook.postCreate "npm install"
 ```
 
 ## Alternative Installation
@@ -103,15 +116,15 @@ git gtr config add gtr.hook.postCreate "npm install"
 
 1. Download the executable:
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr -o git-gtr
-   chmod +x git-gtr
+   curl -fsSL https://github.com/ain3sh/worktree-cli/releases/latest/download/worktree-cli -o worktree-cli
+   chmod +x worktree-cli
    ```
 
 2. Move to a directory in your PATH:
    ```bash
-   mv git-gtr ~/.local/bin/
+   mv worktree-cli ~/.local/bin/
    # or system-wide:
-   sudo mv git-gtr /usr/local/bin/
+   sudo mv worktree-cli /usr/local/bin/
    ```
 
 ### From Source

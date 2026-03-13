@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# git-gtr Installer
-# Installs the git-gtr standalone executable to ~/.local/bin (or custom location)
+# worktree-cli Installer
+# Installs the worktree-cli standalone executable to ~/.local/bin (or custom location)
 #
 # Usage:
 #   ./scripts/install.sh              # Interactive install to ~/.local/bin
@@ -9,6 +9,8 @@
 #
 # Environment variables:
 #   INSTALL_DIR  - Override default install location
+#   WORKTREE_CLI_DOWNLOAD_URL - Override binary download URL
+#   GIT_GTR_DOWNLOAD_URL      - Legacy binary URL override (backward compatibility)
 #
 
 set -e
@@ -79,9 +81,9 @@ check_command() {
 # Create a temporary file path
 make_temp_file() {
   if check_command mktemp; then
-    mktemp "${TMPDIR:-/tmp}/git-gtr.XXXXXX"
+    mktemp "${TMPDIR:-/tmp}/worktree-cli.XXXXXX"
   else
-    echo "${TMPDIR:-/tmp}/git-gtr.$$"
+    echo "${TMPDIR:-/tmp}/worktree-cli.$$"
   fi
 }
 
@@ -192,67 +194,104 @@ install_dependency() {
   return 1
 }
 
-# Find the git-gtr executable
+# Extract version from a binary output like: "worktree-cli version 2.0.0"
+extract_version() {
+  local bin="$1"
+  "$bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown"
+}
+
+# Find local source executable (prefer worktree-cli, fallback legacy git-gtr)
 find_source_file() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-  # Check parent directory (repo root)
-  if [ -f "$script_dir/../git-gtr" ]; then
-    echo "$script_dir/../git-gtr"
-    return 0
+  local candidates=(
+    "$script_dir/../worktree-cli"
+    "$script_dir/worktree-cli"
+    "./worktree-cli"
+    "$script_dir/../git-gtr"
+    "$script_dir/git-gtr"
+    "./git-gtr"
+  )
+
+  local path
+  for path in "${candidates[@]}"; do
+    if [ -f "$path" ]; then
+      echo "$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Download worktree-cli when the installer is run standalone
+download_source_file() {
+  local -a download_urls=()
+  local temp_file
+  local url
+
+  if [ -n "${WORKTREE_CLI_DOWNLOAD_URL:-}" ]; then
+    download_urls+=("$WORKTREE_CLI_DOWNLOAD_URL")
+  fi
+  if [ -n "${GIT_GTR_DOWNLOAD_URL:-}" ]; then
+    download_urls+=("$GIT_GTR_DOWNLOAD_URL")
   fi
 
-  # Check same directory
-  if [ -f "$script_dir/git-gtr" ]; then
-    echo "$script_dir/git-gtr"
-    return 0
+  if [ ${#download_urls[@]} -eq 0 ]; then
+    download_urls=(
+      "https://github.com/ain3sh/worktree-cli/releases/latest/download/worktree-cli"
+      "https://raw.githubusercontent.com/ain3sh/worktree-cli/main/worktree-cli"
+      "https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr"
+    )
   fi
 
-  # Check current directory
-  if [ -f "./git-gtr" ]; then
-    echo "./git-gtr"
-    return 0
+  if check_command curl; then
+    for url in "${download_urls[@]}"; do
+      temp_file=$(make_temp_file)
+      if curl -fsSL "$url" -o "$temp_file"; then
+        chmod +x "$temp_file"
+        echo "$temp_file"
+        return 0
+      fi
+      rm -f "$temp_file"
+    done
+    return 1
+  fi
+
+  if check_command wget; then
+    for url in "${download_urls[@]}"; do
+      temp_file=$(make_temp_file)
+      if wget -qO "$temp_file" "$url"; then
+        chmod +x "$temp_file"
+        echo "$temp_file"
+        return 0
+      fi
+      rm -f "$temp_file"
+    done
+    return 1
   fi
 
   return 1
 }
 
-# Download git-gtr when the installer is run standalone
-download_source_file() {
-  local download_url="${GIT_GTR_DOWNLOAD_URL:-https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr}"
-  local temp_file
-
-  if check_command curl; then
-    temp_file=$(make_temp_file)
-    if curl -fsSL "$download_url" -o "$temp_file"; then
-      chmod +x "$temp_file"
-      echo "$temp_file"
-      return 0
-    fi
-    rm -f "$temp_file"
-    return 1
-  fi
-
-  if check_command wget; then
-    temp_file=$(make_temp_file)
-    if wget -qO "$temp_file" "$download_url"; then
-      chmod +x "$temp_file"
-      echo "$temp_file"
-      return 0
-    fi
-    rm -f "$temp_file"
-    return 1
-  fi
-
-  return 1
+# Create or refresh legacy git-gtr compatibility shim (for `git gtr` users)
+write_legacy_shim() {
+  local destination="$1"
+  cat > "$destination" <<'SHIM'
+#!/usr/bin/env bash
+set -e
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SELF_DIR/worktree-cli" "$@"
+SHIM
+  chmod +x "$destination"
 }
 
 # Main installation
 main() {
   echo ""
-  echo "${BOLD}git-gtr Installer${RESET}"
-  echo "=================="
+  echo "${BOLD}worktree-cli Installer${RESET}"
+  echo "========================"
   echo ""
 
   local os
@@ -295,24 +334,28 @@ main() {
 
   echo ""
 
-  # Find the git-gtr executable
+  # Find the source executable
   local source_file
   local source_is_temp=0
   if ! source_file=$(find_source_file); then
-    log_warn "git-gtr executable not found locally; downloading standalone binary..."
+    log_warn "worktree-cli executable not found locally; downloading standalone binary..."
 
     if ! source_file=$(download_source_file); then
-      log_error "Failed to download git-gtr"
+      log_error "Failed to download standalone binary"
       echo "  Expected local locations:"
-      echo "    - ./git-gtr (repo root)"
-      echo "    - ../git-gtr (if running from scripts/)"
-      echo "  Download URL: ${GIT_GTR_DOWNLOAD_URL:-https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr}"
-      echo "  Make sure curl or wget is installed, or set GIT_GTR_DOWNLOAD_URL explicitly"
+      echo "    - ./worktree-cli (repo root)"
+      echo "    - ../worktree-cli (if running from scripts/)"
+      echo "    - ./git-gtr (legacy name)"
+      echo "  Tried defaults:"
+      echo "    - https://github.com/ain3sh/worktree-cli/releases/latest/download/worktree-cli"
+      echo "    - https://raw.githubusercontent.com/ain3sh/worktree-cli/main/worktree-cli"
+      echo "    - https://raw.githubusercontent.com/ain3sh/worktree-cli/main/git-gtr"
+      echo "  Make sure curl or wget is installed, or set WORKTREE_CLI_DOWNLOAD_URL"
       exit 1
     fi
 
     source_is_temp=1
-    log_info "Downloaded git-gtr to temporary file"
+    log_info "Downloaded standalone binary to temporary file"
   else
     source_file="$(cd "$(dirname "$source_file")" && pwd)/$(basename "$source_file")"
   fi
@@ -320,21 +363,30 @@ main() {
   # Get install directory
   local install_dir
   install_dir=$(get_install_dir)
-  local install_path="$install_dir/git-gtr"
+  local install_path="$install_dir/worktree-cli"
+  local legacy_path="$install_dir/git-gtr"
 
-  log_step "Installing git-gtr..."
+  log_step "Installing worktree-cli..."
   echo "  Source: $source_file"
   echo "  Destination: $install_path"
+  echo "  Compatibility shim: $legacy_path"
   echo ""
 
   # Check if already installed
+  local existing_path=""
   if [ -f "$install_path" ]; then
-    local existing_version=""
-    existing_version=$("$install_path" --version 2>/dev/null | awk '{print $4}' || echo "unknown")
-    local new_version=""
-    new_version=$("$source_file" --version 2>/dev/null | awk '{print $4}' || echo "unknown")
+    existing_path="$install_path"
+  elif [ -f "$legacy_path" ]; then
+    existing_path="$legacy_path"
+  fi
 
-    log_warn "git-gtr already exists at $install_path (v$existing_version)"
+  if [ -n "$existing_path" ]; then
+    local existing_version=""
+    existing_version=$(extract_version "$existing_path")
+    local new_version=""
+    new_version=$(extract_version "$source_file")
+
+    log_warn "Existing install found at $existing_path (v$existing_version)"
     echo "  New version: v$new_version"
     read -p "  Overwrite? [y/N] " -n 1 -r
     echo
@@ -350,13 +402,20 @@ main() {
   fi
 
   # Copy the file
+  local temp_file=""
   if is_root || [ -w "$install_dir" ]; then
     cp "$source_file" "$install_path"
     chmod +x "$install_path"
+    write_legacy_shim "$legacy_path"
   else
     log_warn "Need sudo to write to $install_dir"
     sudo cp "$source_file" "$install_path"
     sudo chmod +x "$install_path"
+    temp_file=$(make_temp_file)
+    write_legacy_shim "$temp_file"
+    sudo cp "$temp_file" "$legacy_path"
+    sudo chmod +x "$legacy_path"
+    rm -f "$temp_file"
   fi
 
   if [ "$source_is_temp" -eq 1 ]; then
@@ -364,6 +423,7 @@ main() {
   fi
 
   log_info "Installed: $install_path"
+  log_info "Legacy compatibility updated: $legacy_path"
 
   # Check if install_dir is in PATH
   if ! echo "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
@@ -398,22 +458,29 @@ main() {
   log_step "Installation complete!"
   echo ""
   echo "  Usage:"
-  echo "    git gtr new <branch>      # Create worktree"
-  echo "    git gtr editor <branch>   # Open in editor"
-  echo "    git gtr ai <branch>       # Start AI tool"
-  echo "    git gtr --help            # Show all commands"
+  echo "    worktree-cli new <branch>      # Create worktree"
+  echo "    worktree-cli editor <branch>   # Open in editor"
+  echo "    worktree-cli ai <branch>       # Start AI tool"
+  echo "    worktree-cli --help            # Show all commands"
+  echo "    git gtr <...>                  # Backward-compatible via shim"
   echo ""
   echo "  Quick setup (run in your git repo):"
-  echo "    git gtr config set gtr.editor.default cursor"
-  echo "    git gtr config set gtr.ai.default claude"
+  echo "    worktree-cli config set gtr.editor.default cursor"
+  echo "    worktree-cli config set gtr.ai.default claude"
+  echo ""
+  echo "  Optional convenience alias:"
+  echo "    # bash"
+  echo "    echo \"alias gwk='worktree-cli'\" >> ~/.bashrc"
+  echo "    # zsh"
+  echo "    echo \"alias gwk='worktree-cli'\" >> ~/.zshrc"
   echo ""
 
   # Verify installation
-  if check_command git-gtr; then
-    log_info "Verification: git-gtr is accessible"
-    echo "  Version: $(git-gtr --version)"
+  if check_command worktree-cli; then
+    log_info "Verification: worktree-cli is accessible"
+    echo "  Version: $(worktree-cli --version)"
   else
-    log_warn "git-gtr not found in PATH yet. You may need to:"
+    log_warn "worktree-cli not found in PATH yet. You may need to:"
     echo "  1. Add $install_dir to PATH (see above)"
     echo "  2. Restart your terminal"
   fi
