@@ -19,16 +19,28 @@ on:
     tags:
       - 'v*'
 
+  # Auto-sync with upstream releases
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Standalone Executable
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      release_reason: ${{ steps.meta.outputs.release_reason }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Clone git-worktree-runner source
         run: |
@@ -37,35 +49,71 @@ jobs:
       - name: Build standalone executable
         run: |
           chmod +x .github/scripts/build-standalone.sh
-          .github/scripts/build-standalone.sh --source-dir /tmp/gtr-source --output ./git-gtr
+          .github/scripts/build-standalone.sh --source-dir /tmp/gtr-source --output ./worktree-cli --shim-output ./git-gtr
 
-      - name: Determine version
-        id: version
+      - name: Determine release metadata
+        id: meta
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          EVENT_NAME="${{ github.event_name }}"
+          INPUT_VERSION="${{ inputs.version }}"
+          INPUT_CREATE_RELEASE="${{ inputs.create_release }}"
+
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+            RELEASE_REASON="manual-version"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VERSION="${{ github.ref_name }}"
-            VERSION="${VERSION#v}"  # Remove 'v' prefix
+            VERSION="${VERSION#v}"
+            RELEASE_REASON="tag-push"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            UPSTREAM_TAG=$(curl -fsSL https://api.github.com/repos/coderabbitai/git-worktree-runner/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
+            VERSION="${UPSTREAM_TAG#v}"
+            RELEASE_REASON="upstream-release"
           else
-            VERSION=$(./git-gtr --version | awk '{print $4}')
+            VERSION=$(./worktree-cli --version | awk '{print $NF}')
+            RELEASE_REASON="manual-default"
           fi
+
+          TAG="v$VERSION"
+          SHOULD_RELEASE="false"
+
+          if [ "$EVENT_NAME" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            SHOULD_RELEASE="true"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_CREATE_RELEASE" = "true" ]; then
+            SHOULD_RELEASE="true"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "Tag $TAG already exists; skipping release"
+            else
+              SHOULD_RELEASE="true"
+            fi
+          fi
+
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "should_release=$SHOULD_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_reason=$RELEASE_REASON" >> $GITHUB_OUTPUT
           echo "Detected version: $VERSION"
+          echo "Release tag: $TAG"
+          echo "Should release: $SHOULD_RELEASE"
+          echo "Reason: $RELEASE_REASON"
 
       - name: Test executable
         run: |
           echo "Testing basic commands..."
+          chmod +x ./worktree-cli ./git-gtr
+          ./worktree-cli --version
+          ./worktree-cli help | head -20
+          ./worktree-cli adapter
           ./git-gtr --version
-          ./git-gtr help | head -20
-          ./git-gtr adapter
           echo "All tests passed!"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: git-gtr-standalone
+          name: worktree-cli-standalone
           path: |
+            worktree-cli
             git-gtr
             scripts/install.sh
           retention-days: 30
@@ -74,12 +122,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.create_release)
-
-    permissions:
-      contents: write
+    if: needs.build.outputs.should_release == 'true'
 
     steps:
       - name: Checkout repository
@@ -88,55 +131,66 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: git-gtr-standalone
+          name: worktree-cli-standalone
           path: ./release
 
       - name: Prepare release assets
         run: |
           cd release
-          chmod +x git-gtr scripts/install.sh
+          chmod +x worktree-cli git-gtr scripts/install.sh
 
           # Create tarball
-          tar -czf git-gtr-v${{ needs.build.outputs.version }}.tar.gz git-gtr scripts/
+          tar -czf worktree-cli-v${{ needs.build.outputs.version }}.tar.gz worktree-cli git-gtr scripts/
 
           # Create checksums
-          sha256sum git-gtr > git-gtr.sha256
-          sha256sum git-gtr-v${{ needs.build.outputs.version }}.tar.gz >> git-gtr.sha256
+          sha256sum worktree-cli > worktree-cli.sha256
+          sha256sum git-gtr >> worktree-cli.sha256
+          sha256sum worktree-cli-v${{ needs.build.outputs.version }}.tar.gz >> worktree-cli.sha256
 
           ls -la
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: git-gtr v${{ needs.build.outputs.version }}
-          tag_name: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
+          name: worktree-cli v${{ needs.build.outputs.version }}
+          tag_name: ${{ needs.build.outputs.tag }}
           generate_release_notes: true
           draft: ${{ github.event_name == 'workflow_dispatch' }}
           files: |
+            release/worktree-cli
             release/git-gtr
             release/scripts/install.sh
-            release/git-gtr-v${{ needs.build.outputs.version }}.tar.gz
-            release/git-gtr.sha256
+            release/worktree-cli-v${{ needs.build.outputs.version }}.tar.gz
+            release/worktree-cli.sha256
           body: |
-            ## git-gtr Standalone v${{ needs.build.outputs.version }}
+            ## worktree-cli Standalone v${{ needs.build.outputs.version }}
+
+            Release reason: `${{ needs.build.outputs.release_reason }}`
 
             A single-file standalone distribution of [git-worktree-runner](https://github.com/coderabbitai/git-worktree-runner).
 
             ### Installation
 
-            **Quick install (recommended):**
+            **Quick install / update (recommended):**
             ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ needs.build.outputs.version }}/install.sh | bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash
             ```
 
             **Manual install:**
             ```bash
             # Download the executable
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ needs.build.outputs.version }}/git-gtr -o ~/.local/bin/git-gtr
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ needs.build.outputs.tag }}/worktree-cli -o ~/.local/bin/worktree-cli
+            chmod +x ~/.local/bin/worktree-cli
+
+            # Backward compatibility for `git gtr`
+            cat > ~/.local/bin/git-gtr <<'EOF'
+            #!/usr/bin/env bash
+            exec "$(dirname "$0")/worktree-cli" "$@"
+            EOF
             chmod +x ~/.local/bin/git-gtr
 
             # Verify installation
-            git gtr --version
+            worktree-cli --version
             ```
 
             ### Requirements
@@ -145,5 +199,5 @@ jobs:
 
             ### Checksums
             ```
-            $(cat release/git-gtr.sha256)
+            $(cat release/worktree-cli.sha256)
             ```
